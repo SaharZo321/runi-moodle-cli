@@ -62,3 +62,146 @@ def test_auth_login_cookie_and_courses_json(moodle_api):
     assert len(courses_data) == 1
     assert courses_data[0]["name"] == "Algorithms"
     assert courses_data[0]["course_number"] == 101
+
+    # Subcommand-position --json also works
+    courses_after = runner.invoke(app, ["courses", "--json"])
+    assert courses_after.exit_code == 0, courses_after.stdout
+    assert json.loads(courses_after.stdout) == courses_data
+
+
+def test_read_plain_text_when_piped_and_json_when_requested(monkeypatch):
+    monkeypatch.setattr(
+        "runi_moodle_cli.reading.read_content",
+        lambda url, offset=0: {"name": "notes.pdf", "text": "Hello [world]\nLine 2", "total_chars": 20},
+    )
+
+    plain = runner.invoke(app, ["read", "https://moodle.runi.ac.il/2027/pluginfile.php/1/notes.pdf"])
+    assert plain.exit_code == 0, plain.stdout
+    assert plain.stdout == "Hello [world]\nLine 2\n"
+
+    as_json = runner.invoke(app, ["read", "https://moodle.runi.ac.il/2027/pluginfile.php/1/notes.pdf", "--json"])
+    assert as_json.exit_code == 0, as_json.stdout
+    payload = json.loads(as_json.stdout)
+    assert payload["name"] == "notes.pdf"
+    assert payload["text"] == "Hello [world]\nLine 2"
+
+
+def test_read_tty_escapes_filename_and_preserves_literal_emoji_and_brackets(monkeypatch):
+    monkeypatch.setattr(
+        "runi_moodle_cli.reading.read_content",
+        lambda url, offset=0: {
+            "name": "Week [draft].pdf",
+            "text": "Status: :warning: [not markup]",
+            "total_chars": 30,
+        },
+    )
+    monkeypatch.setattr("runi_moodle_cli.cli._stdout_is_tty", lambda: True)
+
+    res = runner.invoke(app, ["read", "https://moodle.runi.ac.il/2027/pluginfile.php/1/notes.pdf"])
+    assert res.exit_code == 0, res.stdout
+    assert "Week [draft].pdf" in res.stdout
+    assert ":warning:" in res.stdout
+    assert "[not markup]" in res.stdout
+
+
+def test_read_piped_error_is_human_not_json(monkeypatch):
+    from runi_moodle_cli.client import MoodleError
+
+    def boom(url, offset=0):
+        raise MoodleError("File not found")
+
+    monkeypatch.setattr("runi_moodle_cli.reading.read_content", boom)
+    res = runner.invoke(app, ["read", "https://moodle.runi.ac.il/2027/pluginfile.php/1/missing.pdf"])
+    assert res.exit_code == 4
+    assert "File not found" in res.output
+    assert '"ok": false' not in res.stdout
+
+
+def test_auth_login_default_credentials_and_preserves_password_whitespace(monkeypatch):
+    captured: dict[str, str] = {}
+
+    def fake_login(username, password, year, base_url):
+        captured["username"] = username
+        captured["password"] = password
+        return "tok_from_creds", {"userid": 5, "fullname": "Sahar", "username": username}
+
+    monkeypatch.setattr("runi_moodle_cli.auth.login_with_credentials", fake_login)
+
+    # Default (no flag) with 2-line stdin
+    res1 = runner.invoke(app, ["auth", "login", "--year", "2027", "--pretty"], input="sahar.zolberg\n  pass with spaces \n")
+    assert res1.exit_code == 0, res1.stdout
+    data1 = json.loads(res1.stdout)
+    assert data1["method"] == "credentials"
+    assert "\n  " in res1.stdout  # --pretty indented JSON
+    assert captured == {"username": "sahar.zolberg", "password": "  pass with spaces "}
+
+    # --username with password on stdin also preserves spaces
+    res2 = runner.invoke(app, ["auth", "login", "--year", "2027", "-u", "sahar.zolberg", "--json"], input="  lead_and_trail  \n")
+    assert res2.exit_code == 0, res2.stdout
+    assert json.loads(res2.stdout)["ok"] is True
+    assert captured["password"] == "  lead_and_trail  "
+
+    # Single-line piped stdin with no flag gives a helpful hint naming --cookie / --token
+    res3 = runner.invoke(app, ["auth", "login", "--year", "2027", "--json"], input="only_one_line\n")
+    assert res3.exit_code == 3
+    err_msg = json.loads(res3.stdout)["error"]["message"]
+    assert "--cookie" in err_msg and "--token" in err_msg
+
+
+def test_auth_login_tty_prompts_go_to_stderr_keeping_json_stdout_clean(monkeypatch):
+    monkeypatch.setattr(
+        "runi_moodle_cli.auth.login_with_credentials",
+        lambda u, p, year, base_url: ("tok_tty", {"userid": 8, "fullname": "Sahar", "username": u}),
+    )
+    prompt_calls: list[dict] = []
+
+    def fake_prompt(text, hide_input=False, err=False):
+        prompt_calls.append({"text": text, "hide_input": hide_input, "err": err})
+        return "sahar.zolberg" if not hide_input else "pw"
+
+    monkeypatch.setattr("runi_moodle_cli.cli._stdin_is_tty", lambda: True)
+    monkeypatch.setattr("typer.prompt", fake_prompt)
+
+    res = runner.invoke(app, ["auth", "login", "--year", "2027", "--pretty"])
+    assert res.exit_code == 0, res.stdout
+    payload = json.loads(res.stdout)
+    assert payload["ok"] is True
+    assert payload["method"] == "credentials"
+    assert all(call["err"] is True for call in prompt_calls)
+
+
+def test_auth_login_flag_validation_and_mobile_token_url(monkeypatch):
+    res_conflict = runner.invoke(app, ["auth", "login", "--credentials", "--cookie", "--json"])
+    assert res_conflict.exit_code == 2
+
+    res_user_cookie = runner.invoke(app, ["auth", "login", "--cookie", "-u", "sahar", "--json"])
+    assert res_user_cookie.exit_code == 2
+
+    res_empty_tok = runner.invoke(app, ["auth", "login", "--token", "--json"], input="   \n")
+    assert res_empty_tok.exit_code == 3
+
+    b64_tok = base64.b64encode(b"sig:::direct_mobile_tok").decode()
+    monkeypatch.setattr(
+        "runi_moodle_cli.auth.verify_token",
+        lambda year, token, base_url: {"userid": 11, "fullname": "Sahar", "username": "sahar"},
+    )
+    res_tok = runner.invoke(
+        app,
+        ["auth", "login", "--year", "2027", "--token", "--json"],
+        input=f"MOODLEMOBILE://token={b64_tok}\n",
+    )
+    assert res_tok.exit_code == 0, res_tok.stdout
+    assert json.loads(res_tok.stdout)["method"] == "token"
+
+
+def test_subcommand_year_overrides_root_year(monkeypatch):
+    seen: list[int | None] = []
+
+    def fake_list_courses(semester=None, year=None):
+        seen.append(year)
+        return []
+
+    monkeypatch.setattr("runi_moodle_cli.courses.list_courses", fake_list_courses)
+    res = runner.invoke(app, ["--year", "2026", "courses", "--year", "2027", "--json"])
+    assert res.exit_code == 0, res.stdout
+    assert seen == [2027]

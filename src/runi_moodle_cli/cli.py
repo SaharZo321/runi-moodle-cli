@@ -6,11 +6,13 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Annotated, Any, Callable, Optional
 
 import httpx
 import typer
+from rich import box
 from rich.console import Console
+from rich.markup import escape as escape_markup
 from rich.table import Table
 
 from runi_moodle_cli import (
@@ -51,6 +53,16 @@ console = Console()
 err_console = Console(stderr=True)
 
 
+def _table(title: str | None = None) -> Table:
+    """Create a borderless table (no vertical box lines that misalign with Hebrew RTL fonts)."""
+    return Table(title=title, box=box.SIMPLE_HEAD, pad_edge=False)
+
+
+JsonOpt = Annotated[bool, typer.Option("--json", help="Emit JSON output.")]
+PrettyOpt = Annotated[bool, typer.Option("--pretty", help="Pretty-print JSON output.")]
+YearOpt = Annotated[Optional[int], typer.Option("--year", "-y", help="Academic year (e.g. 2027). Defaults to configured default.")]
+
+
 @dataclass
 class GlobalState:
     year: int | None = None
@@ -58,26 +70,60 @@ class GlobalState:
     pretty: bool = False
 
 
-def _state(ctx: typer.Context) -> GlobalState:
+def _state(
+    ctx: typer.Context,
+    *,
+    as_json: bool = False,
+    pretty: bool = False,
+    year: int | None = None,
+) -> GlobalState:
     if ctx.obj is None:
         ctx.obj = GlobalState()
-    return ctx.obj
+    state: GlobalState = ctx.obj
+    if as_json or pretty:
+        state.as_json = True
+    if pretty:
+        state.pretty = True
+    if year is not None:
+        state.year = year
+    return state
 
 
-def _wants_json(state: GlobalState) -> bool:
-    return state.as_json or not sys.stdout.isatty()
+def _stdin_is_tty() -> bool:
+    return sys.stdin.isatty()
 
 
-def _emit(state: GlobalState, data: Any, render_human: Callable[[Any], None]) -> None:
-    if _wants_json(state):
+def _stdout_is_tty() -> bool:
+    return sys.stdout.isatty()
+
+
+def _wants_json(state: GlobalState, *, auto_json: bool = True) -> bool:
+    return state.as_json or (auto_json and not _stdout_is_tty())
+
+
+def _emit(
+    state: GlobalState,
+    data: Any,
+    render_human: Callable[[Any], None],
+    *,
+    auto_json: bool = True,
+) -> None:
+    if _wants_json(state, auto_json=auto_json):
         indent = 2 if state.pretty else None
         sys.stdout.write(json.dumps(data, ensure_ascii=False, indent=indent) + "\n")
     else:
         render_human(data)
 
 
-def _fail(state: GlobalState, code: str, message: str, exit_code: int) -> None:
-    if _wants_json(state):
+def _fail(
+    state: GlobalState,
+    code: str,
+    message: str,
+    exit_code: int,
+    *,
+    auto_json: bool = True,
+) -> None:
+    if _wants_json(state, auto_json=auto_json):
         indent = 2 if state.pretty else None
         sys.stdout.write(
             json.dumps({"ok": False, "error": {"code": code, "message": message}, "exit_code": exit_code}, indent=indent)
@@ -88,31 +134,39 @@ def _fail(state: GlobalState, code: str, message: str, exit_code: int) -> None:
     raise typer.Exit(code=exit_code)
 
 
-def _run(state: GlobalState, fn: Callable[[], Any], render_human: Callable[[Any], None]) -> None:
+def _run(
+    state: GlobalState,
+    fn: Callable[[], Any],
+    render_human: Callable[[Any], None],
+    *,
+    auto_json: bool = True,
+) -> None:
     try:
         data = fn()
     except AuthError as exc:
-        _fail(state, "auth", str(exc), 3)
+        _fail(state, "auth", str(exc), 3, auto_json=auto_json)
     except ValueError as exc:
-        _fail(state, "usage", str(exc), 2)
+        _fail(state, "usage", str(exc), 2, auto_json=auto_json)
     except MoodleError as exc:
-        _fail(state, "moodle", str(exc), 4)
+        _fail(state, "moodle", str(exc), 4, auto_json=auto_json)
     except httpx.HTTPError as exc:
-        _fail(state, "network", f"Could not reach Moodle: {exc}", 4)
-    _emit(state, data, render_human)
+        _fail(state, "network", f"Could not reach Moodle: {exc}", 4, auto_json=auto_json)
+    _emit(state, data, render_human, auto_json=auto_json)
 
 
-def _read_secret(prompt_text: str) -> str:
-    if not sys.stdin.isatty():
-        return sys.stdin.read().strip()
-    return typer.prompt(prompt_text, hide_input=True).strip()
+def _read_secret(prompt_text: str, *, strip_whitespace: bool = True) -> str:
+    if not _stdin_is_tty():
+        raw = sys.stdin.read()
+        return raw.strip() if strip_whitespace else raw.rstrip("\r\n")
+    val = typer.prompt(prompt_text, hide_input=True, err=True)
+    return val.strip() if strip_whitespace else val
 
 
 def _print_deadlines(items: list[dict]) -> None:
     if not items:
         console.print("[green]No upcoming deadlines.[/green]")
         return
-    table = Table(title="Upcoming Deadlines")
+    table = _table("Upcoming Deadlines")
     table.add_column("Due", style="cyan", no_wrap=True)
     table.add_column("Course", style="magenta")
     table.add_column("Item")
@@ -150,24 +204,47 @@ def root(
 def auth_login(
     ctx: typer.Context,
     year: Optional[int] = typer.Option(None, "--year", "-y", help="Academic year (defaults to current academic year)."),
+    credentials: bool = typer.Option(False, "--credentials", help="Sign in interactively with RUNI username and password (default)."),
+    username: Optional[str] = typer.Option(None, "--username", "-u", help="RUNI username for credential login."),
     browser: bool = typer.Option(False, "--browser", help="Open a browser window (Playwright) to complete RUNI SSO."),
     cookie: bool = typer.Option(False, "--cookie", help="Exchange a pasted MoodleSession<year> cookie for a long-lived token."),
-    token: bool = typer.Option(False, "--token", help="Save a Moodle mobile wstoken directly."),
+    token: bool = typer.Option(False, "--token", help="Save a Moodle mobile wstoken (or moodlemobile://token=... URL) directly."),
     base_url: str = typer.Option(DEFAULT_BASE_URL, "--base-url", help="Moodle base URL."),
     no_default: bool = typer.Option(False, "--no-default", help="Do not make this year the default year."),
+    as_json: JsonOpt = False,
+    pretty: PrettyOpt = False,
 ) -> None:
     """Sign in to Reichman Moodle and save a long-lived Mobile App token."""
-    state = _state(ctx)
+    state = _state(ctx, as_json=as_json, pretty=pretty)
     target_year = year or state.year or current_academic_year()
 
-    chosen = sum([browser, cookie, token])
+    chosen = sum([credentials, browser, cookie, token])
     if chosen > 1:
-        _fail(state, "usage", "Pass at most one of --browser, --cookie, or --token.", 2)
+        _fail(state, "usage", "Pass at most one of --credentials, --browser, --cookie, or --token.", 2)
     if chosen == 0:
-        cookie = True
+        credentials = True
+    if username is not None and not credentials:
+        _fail(state, "usage", "--username can only be used with credential login.", 2)
 
     def do_login() -> dict:
-        if browser:
+        if credentials:
+            if username is not None:
+                user = username.strip()
+                pw = _read_secret("RUNI password", strip_whitespace=False)
+            elif _stdin_is_tty():
+                user = typer.prompt("RUNI username", err=True).strip()
+                pw = typer.prompt("RUNI password", hide_input=True, err=True)
+            else:
+                lines = sys.stdin.read().splitlines()
+                if len(lines) < 2:
+                    raise AuthError(
+                        "Expected username and password on stdin (two lines), "
+                        "or pass --username, --cookie, or --token."
+                    )
+                user, pw = lines[0].strip(), lines[1]
+            tok, info = auth.login_with_credentials(user, pw, year=target_year, base_url=base_url)
+            method = "credentials"
+        elif browser:
             if not _wants_json(state):
                 console.print(f"Opening browser to sign in to {base_url.rstrip('/')}/{target_year}...")
             tok, info = auth.login_with_browser(year=target_year, base_url=base_url)
@@ -177,9 +254,11 @@ def auth_login(
             tok, info = auth.exchange_cookie_for_token(raw_cookie, year=target_year, base_url=base_url)
             method = "cookie"
         else:
-            raw_token = _read_secret(f"Paste your Moodle mobile token for {target_year}")
-            info = auth.verify_token(year=target_year, token=raw_token, base_url=base_url)
-            tok = raw_token.strip()
+            raw_token = _read_secret(f"Paste your Moodle mobile token for {target_year}").strip()
+            if not raw_token:
+                raise AuthError("Empty Moodle token.")
+            tok = auth.parse_mobile_redirect(raw_token) if raw_token.lower().startswith("moodlemobile://") else raw_token
+            info = auth.verify_token(year=target_year, token=tok, base_url=base_url)
             method = "token"
 
         saved_to = save_token(
@@ -213,9 +292,11 @@ def auth_login(
 def auth_status(
     ctx: typer.Context,
     check: bool = typer.Option(True, "--check/--no-check", help="Verify stored tokens against Moodle."),
+    as_json: JsonOpt = False,
+    pretty: PrettyOpt = False,
 ) -> None:
     """Show configured Moodle years and verify whether stored tokens are valid."""
-    state = _state(ctx)
+    state = _state(ctx, as_json=as_json, pretty=pretty)
 
     def do_status() -> dict:
         cfg = load_config()
@@ -250,7 +331,7 @@ def auth_status(
                 f"[yellow]Not signed in.[/yellow] Run `runi auth login --year {current_academic_year()}`."
             )
             return
-        table = Table(title=f"Moodle Auth ({res['config_path']})")
+        table = _table(f"Moodle Auth ({res['config_path']})")
         table.add_column("Year", style="cyan")
         table.add_column("Site")
         table.add_column("Default")
@@ -277,9 +358,11 @@ def auth_logout(
     ctx: typer.Context,
     year: Optional[int] = typer.Option(None, "--year", "-y", help="Remove only this year's token."),
     all_years: bool = typer.Option(False, "--all", help="Remove all stored tokens."),
+    as_json: JsonOpt = False,
+    pretty: PrettyOpt = False,
 ) -> None:
     """Remove stored Moodle tokens from local config."""
-    state = _state(ctx)
+    state = _state(ctx, as_json=as_json, pretty=pretty)
     target = None if all_years else (year or state.year)
 
     def do_logout() -> dict:
@@ -307,9 +390,12 @@ def cmd_due(
     ctx: typer.Context,
     days: int = typer.Option(14, "--days", "-d", help="Days ahead to check."),
     overdue: bool = typer.Option(False, "--overdue", help="Include items past due in the last 30 days."),
+    year: YearOpt = None,
+    as_json: JsonOpt = False,
+    pretty: PrettyOpt = False,
 ) -> None:
     """Show upcoming actionable deadlines."""
-    state = _state(ctx)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
     _run(state, lambda: deadlines.upcoming_deadlines(days, overdue, state.year), _print_deadlines)
 
 
@@ -317,15 +403,18 @@ def cmd_due(
 def cmd_courses(
     ctx: typer.Context,
     semester: Optional[int] = typer.Option(None, "--semester", "-s", help="Filter by semester (1 or 2)."),
+    year: YearOpt = None,
+    as_json: JsonOpt = False,
+    pretty: PrettyOpt = False,
 ) -> None:
     """List your enrolled courses."""
-    state = _state(ctx)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
 
     def render(items: list[dict]) -> None:
         if not items:
             console.print("No courses found.")
             return
-        table = Table(title="Courses")
+        table = _table("Courses")
         table.add_column("ID", style="cyan", no_wrap=True)
         table.add_column("Number", style="dim", no_wrap=True)
         table.add_column("Sem", no_wrap=True)
@@ -347,9 +436,12 @@ def cmd_course(
     ctx: typer.Context,
     query: str = typer.Argument(..., help="Course ID, RUNI course number, or partial course name."),
     view: str = typer.Argument("contents", help="What to show: contents, staff, or grades."),
+    year: YearOpt = None,
+    as_json: JsonOpt = False,
+    pretty: PrettyOpt = False,
 ) -> None:
     """Inspect a single course (contents, staff, or grades)."""
-    state = _state(ctx)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
     mode = view.lower()
     if mode not in {"contents", "staff", "grades"}:
         _fail(state, "usage", f"view must be one of contents, staff, grades (got {view!r}).", 2)
@@ -366,7 +458,7 @@ def cmd_course(
         c = data["course"]
         console.print(f"[bold cyan]{c['name']}[/bold cyan] [dim](id={c['id']})[/dim]")
         if mode == "staff":
-            table = Table()
+            table = _table()
             table.add_column("Role", style="cyan")
             table.add_column("Name")
             for s in data["staff"]:
@@ -376,7 +468,7 @@ def cmd_course(
             g = data["grades"]
             if g.get("total"):
                 console.print(f"Course total: [bold]{g['total']}[/bold]")
-            table = Table()
+            table = _table()
             table.add_column("Item")
             table.add_column("Grade", style="green")
             table.add_column("Range", style="dim")
@@ -403,9 +495,12 @@ def cmd_assignments(
     status: str = typer.Option("all", "--status", help="Filter: all, pending, or submitted."),
     overdue: bool = typer.Option(False, "--overdue", help="Include past-due assignments."),
     new_only: bool = typer.Option(False, "--new", help="Show assignments added or updated today."),
+    year: YearOpt = None,
+    as_json: JsonOpt = False,
+    pretty: PrettyOpt = False,
 ) -> None:
     """List assignments across all courses."""
-    state = _state(ctx)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
     if new_only:
         def render_new(res: dict) -> None:
             if res["first_run"]:
@@ -428,7 +523,7 @@ def cmd_assignments(
         if not items:
             console.print("No assignments found.")
             return
-        table = Table(title="Assignments")
+        table = _table("Assignments")
         table.add_column("ID", style="cyan", no_wrap=True)
         table.add_column("Due", no_wrap=True)
         table.add_column("Course", style="magenta")
@@ -449,9 +544,12 @@ def cmd_assignments(
 def cmd_assignment(
     ctx: typer.Context,
     assignment_id: int = typer.Argument(..., help="Assignment ID from `runi assignments`."),
+    year: YearOpt = None,
+    as_json: JsonOpt = False,
+    pretty: PrettyOpt = False,
 ) -> None:
     """Show full details, submission status, grade, and feedback for one assignment."""
-    state = _state(ctx)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
 
     def render(a: dict) -> None:
         console.print(f"[bold cyan]{a['name']}[/bold cyan] ({a['course']})")
@@ -476,9 +574,12 @@ def cmd_assignment(
 def cmd_grades(
     ctx: typer.Context,
     course: Optional[str] = typer.Argument(None, help="Optional course ID, number, or partial name."),
+    year: YearOpt = None,
+    as_json: JsonOpt = False,
+    pretty: PrettyOpt = False,
 ) -> None:
     """Show overall grades across courses, or detailed grade items for one course."""
-    state = _state(ctx)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
 
     def fetch() -> dict:
         if course is None:
@@ -490,7 +591,7 @@ def cmd_grades(
 
     def render(data: dict) -> None:
         if "courses" in data:
-            table = Table(title="Course Grades")
+            table = _table("Course Grades")
             table.add_column("ID", style="cyan", no_wrap=True)
             table.add_column("Course")
             table.add_column("Grade", style="green")
@@ -501,7 +602,7 @@ def cmd_grades(
         title = f"Grades: {data.get('course', data['course_id'])}"
         if data.get("total"):
             title += f" (Total: {data['total']})"
-        table = Table(title=title)
+        table = _table(title)
         table.add_column("Item")
         table.add_column("Grade", style="green")
         table.add_column("Range", style="dim")
@@ -518,9 +619,12 @@ def cmd_messages(
     ctx: typer.Context,
     days: int = typer.Option(7, "--days", "-d", help="How many days back to search."),
     course: Optional[str] = typer.Option(None, "--course", "-c", help="Limit to one course (ID, number, or name)."),
+    year: YearOpt = None,
+    as_json: JsonOpt = False,
+    pretty: PrettyOpt = False,
 ) -> None:
     """Show announcements, staff forum replies, and direct messages."""
-    state = _state(ctx)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
 
     def fetch() -> list[dict]:
         cid = courses.resolve_course(course, state.year)["id"] if course else None
@@ -547,9 +651,12 @@ def cmd_calendar(
     ctx: typer.Context,
     days: int = typer.Option(30, "--days", "-d", help="Days ahead to show."),
     course: Optional[str] = typer.Option(None, "--course", "-c", help="Limit to one course (ID, number, or name)."),
+    year: YearOpt = None,
+    as_json: JsonOpt = False,
+    pretty: PrettyOpt = False,
 ) -> None:
     """Show upcoming Moodle calendar events."""
-    state = _state(ctx)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
 
     def fetch() -> list[dict]:
         cid = courses.resolve_course(course, state.year)["id"] if course else None
@@ -559,7 +666,7 @@ def cmd_calendar(
         if not items:
             console.print(f"No calendar events in the next {days} days.")
             return
-        table = Table(title=f"Calendar (next {days} days)")
+        table = _table(f"Calendar (next {days} days)")
         table.add_column("Start", style="cyan", no_wrap=True)
         table.add_column("Course", style="magenta")
         table.add_column("Event")
@@ -576,9 +683,12 @@ def cmd_search(
     ctx: typer.Context,
     query: str = typer.Argument(..., help="Search query (Hebrew or English)."),
     page: int = typer.Option(0, "--page", "-p", help="Result page number (0-based)."),
+    year: YearOpt = None,
+    as_json: JsonOpt = False,
+    pretty: PrettyOpt = False,
 ) -> None:
     """Search across all your Moodle courses."""
-    state = _state(ctx)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
 
     def render(res: dict) -> None:
         console.print(f"Found {res['total']} results (page {res['page']}):")
@@ -597,17 +707,26 @@ def cmd_read(
     ctx: typer.Context,
     url: str = typer.Argument(..., help="Moodle file URL (pluginfile.php) or Page URL."),
     offset: int = typer.Option(0, "--offset", help="Character offset for long documents."),
+    as_json: JsonOpt = False,
+    pretty: PrettyOpt = False,
 ) -> None:
     """Extract and print text from a Moodle file (PDF, PPTX, DOCX, ipynb, HTML/text) or Page."""
-    state = _state(ctx)
+    state = _state(ctx, as_json=as_json, pretty=pretty)
 
     def render(res: dict) -> None:
-        console.print(f"[bold cyan]{res['name']}[/bold cyan] [dim]({res['total_chars']} chars)[/dim]\n")
-        console.print(res["text"])
+        if not _stdout_is_tty():
+            sys.stdout.write(res["text"])
+            if res["text"] and not res["text"].endswith("\n"):
+                sys.stdout.write("\n")
+            if "next_offset" in res:
+                err_console.print(f"[dim]More text available: rerun with --offset {res['next_offset']}[/dim]")
+            return
+        console.print(f"[bold cyan]{escape_markup(res['name'])}[/bold cyan] [dim]({res['total_chars']} chars)[/dim]\n")
+        console.print(res["text"], markup=False, highlight=False, soft_wrap=True, emoji=False)
         if "next_offset" in res:
             console.print(f"\n[dim]More text available: rerun with --offset {res['next_offset']}[/dim]")
 
-    _run(state, lambda: reading.read_content(url, offset), render)
+    _run(state, lambda: reading.read_content(url, offset), render, auto_json=False)
 
 
 @app.command("download")
@@ -617,9 +736,12 @@ def cmd_download(
     out: Optional[Path] = typer.Option(None, "--out", "-o", help="Destination file or directory."),
     section: Optional[str] = typer.Option(None, "--section", help="When downloading a course, only sections matching this text."),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing files instead of skipping."),
+    year: YearOpt = None,
+    as_json: JsonOpt = False,
+    pretty: PrettyOpt = False,
 ) -> None:
     """Download a single Moodle file URL or all files from a course."""
-    state = _state(ctx)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
 
     if target.startswith(("http://", "https://")):
         def render_one(res: dict) -> None:
