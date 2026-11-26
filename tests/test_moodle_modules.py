@@ -13,13 +13,15 @@ def _mock_courses(moodle_api):
         body = request.content.decode()
         if "core_webservice_get_site_info" in body:
             return httpx.Response(200, json={"userid": 10})
-        if "core_enrol_get_users_courses" in body:
+        if "core_course_get_enrolled_courses_by_timeline_classification" in body:
             return httpx.Response(
                 200,
-                json=[
-                    {"id": 101, "fullname": "Data Structures", "shortname": "Data Structures-59-2027/1 - 27001"},
-                    {"id": 102, "fullname": "Computer Networks", "shortname": "Computer Networks-592-2027/2 - 27002"},
-                ],
+                json={
+                    "courses": [
+                        {"id": 101, "fullname": "Data Structures", "shortname": "Data Structures-59-2027/1 - 27001"},
+                        {"id": 102, "fullname": "Computer Networks", "shortname": "Computer Networks-592-2027/2 - 27002"},
+                    ]
+                },
             )
         if "core_course_get_contents" in body:
             return httpx.Response(

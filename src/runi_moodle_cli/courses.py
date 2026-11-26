@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from runi_moodle_cli.client import call, get_user_id
+from runi_moodle_cli.client import call
 from runi_moodle_cli.config import get_site
 from runi_moodle_cli.formatting import file_list, html_to_text
 
@@ -22,12 +22,18 @@ STAFF_ROLES = {
 
 def list_courses(semester: int | None = None, year: int | None = None) -> list[dict]:
     site = get_site(year)
+    payload = call(
+        "core_course_get_enrolled_courses_by_timeline_classification",
+        year=year,
+        classification="all",
+    )
+    raw_courses = payload.get("courses", []) if isinstance(payload, dict) else payload
     courses = []
-    for c in call("core_enrol_get_users_courses", year=year, userid=get_user_id(year)):
-        match = SHORTNAME.search(c["shortname"])
+    for c in raw_courses:
+        match = SHORTNAME.search(c.get("shortname", ""))
         course = {
             "id": c["id"],
-            "name": c["fullname"],
+            "name": c.get("fullnamedisplay") or c["fullname"],
             "course_number": int(match.group(1)) if match else None,
             "semester": int(match.group(2)) if match else None,
             "url": f"{site.url}/course/view.php?id={c['id']}",

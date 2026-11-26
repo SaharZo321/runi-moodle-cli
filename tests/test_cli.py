@@ -37,10 +37,14 @@ def test_auth_login_cookie_and_courses_json(moodle_api):
         body = request.content.decode()
         if "core_webservice_get_site_info" in body:
             return httpx.Response(200, json={"userid": 7, "fullname": "Sahar Student", "username": "sahar"})
-        if "core_enrol_get_users_courses" in body:
+        if "core_course_get_enrolled_courses_by_timeline_classification" in body:
             return httpx.Response(
                 200,
-                json=[{"id": 55, "fullname": "Algorithms", "shortname": "Algorithms-101-2027/1 - 27055"}],
+                json={
+                    "courses": [
+                        {"id": 55, "fullname": "Algorithms", "shortname": "Algorithms-101-2027/1 - 27055"}
+                    ]
+                },
             )
         return httpx.Response(404)
 
@@ -205,3 +209,29 @@ def test_subcommand_year_overrides_root_year(monkeypatch):
     res = runner.invoke(app, ["--year", "2026", "courses", "--year", "2027", "--json"])
     assert res.exit_code == 0, res.stdout
     assert seen == [2027]
+
+
+def test_lang_flag_defaults_en_and_supports_he_auto_and_validation(configured_site, moodle_api):
+    seen_bodies: list[str] = []
+
+    def handler(request: httpx.Request):
+        body = request.content.decode()
+        seen_bodies.append(body)
+        return httpx.Response(200, json={"courses": []})
+
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/rest/server.php").mock(side_effect=handler)
+
+    r_default = runner.invoke(app, ["courses", "--json"])
+    assert r_default.exit_code == 0
+    assert "moodlewssettinglang=en" in seen_bodies[-1]
+
+    r_he = runner.invoke(app, ["courses", "--lang", "he", "--json"])
+    assert r_he.exit_code == 0
+    assert "moodlewssettinglang=he" in seen_bodies[-1]
+
+    r_auto = runner.invoke(app, ["courses", "--lang", "auto", "--json"])
+    assert r_auto.exit_code == 0
+    assert "moodlewssettinglang=" not in seen_bodies[-1]
+
+    r_bad = runner.invoke(app, ["courses", "--lang", "fr", "--json"])
+    assert r_bad.exit_code == 2

@@ -90,12 +90,14 @@ runi read "https://moodle.runi.ac.il/2027/pluginfile.php/..."
 runi download "https://moodle.runi.ac.il/2027/pluginfile.php/..." --out ./slides.pdf
 runi download "Data Structures" --out ./ds-files --section "Week 1"
 
-# Query another academic year
+# Query another academic year or switch Moodle language (en, he, auto)
 runi --year 2026 courses
+runi courses --lang he
 ```
 
 ## Notes
 
 - **Network:** Reichman's Moodle (`moodle.runi.ac.il`) requires an Israeli IP address.
+- **Language:** Defaults to `en` (English) for consistent course names and labels. Override with `--lang en|he|auto`, `MOODLE_LANG`, or `lang` in `config.json`.
 - **Config location:** Stored in your OS config folder via `platformdirs` (`~/.config/runi-moodle-cli/config.json` on Linux, `~/Library/Application Support/runi-moodle-cli/config.json` on macOS, `%APPDATA%\runi-moodle-cli\config.json` on Windows). Override with `RUNI_MOODLE_CONFIG`.
-- **Environment variables:** `MOODLE_BASE_URL`, `MOODLE_DEFAULT_YEAR`, and `MOODLE_TOKEN_<year>` are also supported as overrides.
+- **Environment variables:** `MOODLE_BASE_URL`, `MOODLE_DEFAULT_YEAR`, `MOODLE_LANG`, and `MOODLE_TOKEN_<year>` are also supported as overrides.

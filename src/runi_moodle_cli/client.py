@@ -38,8 +38,10 @@ def call_site(site: Site, wsfunction: str, **params: Any) -> Any:
         "wsfunction": wsfunction,
         "moodlewsrestformat": "json",
         "moodlewssettingfilter": "true",
-        **_flatten(params),
     }
+    if site.lang:
+        data["moodlewssettinglang"] = site.lang
+    data.update(_flatten(params))
     url = f"{site.url}/webservice/rest/server.php"
     response = _http.post(url, data=data)
     if response.status_code >= 500:

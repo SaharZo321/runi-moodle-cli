@@ -35,8 +35,10 @@ from runi_moodle_cli.config import (
     current_academic_year,
     get_site,
     load_config,
+    normalize_lang,
     remove_token,
     save_token,
+    set_lang_override,
 )
 from runi_moodle_cli.formatting import sanitize_filename
 
@@ -61,11 +63,13 @@ def _table(title: str | None = None) -> Table:
 JsonOpt = Annotated[bool, typer.Option("--json", help="Emit JSON output.")]
 PrettyOpt = Annotated[bool, typer.Option("--pretty", help="Pretty-print JSON output.")]
 YearOpt = Annotated[Optional[int], typer.Option("--year", "-y", help="Academic year (e.g. 2027). Defaults to configured default.")]
+LangOpt = Annotated[Optional[str], typer.Option("--lang", help="Moodle language: en (default), he, or auto (profile default).")]
 
 
 @dataclass
 class GlobalState:
     year: int | None = None
+    lang: str | None = None
     as_json: bool = False
     pretty: bool = False
 
@@ -76,6 +80,7 @@ def _state(
     as_json: bool = False,
     pretty: bool = False,
     year: int | None = None,
+    lang: str | None = None,
 ) -> GlobalState:
     if ctx.obj is None:
         ctx.obj = GlobalState()
@@ -86,6 +91,12 @@ def _state(
         state.pretty = True
     if year is not None:
         state.year = year
+    if lang is not None:
+        try:
+            state.lang = normalize_lang(lang)
+        except ValueError as exc:
+            _fail(state, "usage", str(exc), 2)
+    set_lang_override(state.lang)
     return state
 
 
@@ -182,6 +193,7 @@ def _print_deadlines(items: list[dict]) -> None:
 def root(
     ctx: typer.Context,
     year: Optional[int] = typer.Option(None, "--year", "-y", help="Academic year (e.g. 2027). Defaults to configured default."),
+    lang: LangOpt = None,
     as_json: bool = typer.Option(False, "--json", help="Emit JSON output (automatic when piped)."),
     pretty: bool = typer.Option(False, "--pretty", help="Pretty-print JSON output."),
     version: bool = typer.Option(False, "--version", "-V", help="Show version and exit."),
@@ -191,6 +203,12 @@ def root(
         raise typer.Exit()
 
     state = GlobalState(year=year, as_json=as_json or pretty, pretty=pretty)
+    if lang is not None:
+        try:
+            state.lang = normalize_lang(lang)
+        except ValueError as exc:
+            _fail(state, "usage", str(exc), 2)
+    set_lang_override(state.lang)
     ctx.obj = state
 
     if ctx.invoked_subcommand is None:
@@ -211,11 +229,12 @@ def auth_login(
     token: bool = typer.Option(False, "--token", help="Save a Moodle mobile wstoken (or moodlemobile://token=... URL) directly."),
     base_url: str = typer.Option(DEFAULT_BASE_URL, "--base-url", help="Moodle base URL."),
     no_default: bool = typer.Option(False, "--no-default", help="Do not make this year the default year."),
+    lang: LangOpt = None,
     as_json: JsonOpt = False,
     pretty: PrettyOpt = False,
 ) -> None:
     """Sign in to Reichman Moodle and save a long-lived Mobile App token."""
-    state = _state(ctx, as_json=as_json, pretty=pretty)
+    state = _state(ctx, as_json=as_json, pretty=pretty, lang=lang)
     target_year = year or state.year or current_academic_year()
 
     chosen = sum([credentials, browser, cookie, token])
@@ -266,6 +285,7 @@ def auth_login(
             token=tok,
             base_url=base_url,
             set_default=not no_default,
+            lang=state.lang,
         )
         return {
             "ok": True,
@@ -292,11 +312,12 @@ def auth_login(
 def auth_status(
     ctx: typer.Context,
     check: bool = typer.Option(True, "--check/--no-check", help="Verify stored tokens against Moodle."),
+    lang: LangOpt = None,
     as_json: JsonOpt = False,
     pretty: PrettyOpt = False,
 ) -> None:
     """Show configured Moodle years and verify whether stored tokens are valid."""
-    state = _state(ctx, as_json=as_json, pretty=pretty)
+    state = _state(ctx, as_json=as_json, pretty=pretty, lang=lang)
 
     def do_status() -> dict:
         cfg = load_config()
@@ -391,11 +412,12 @@ def cmd_due(
     days: int = typer.Option(14, "--days", "-d", help="Days ahead to check."),
     overdue: bool = typer.Option(False, "--overdue", help="Include items past due in the last 30 days."),
     year: YearOpt = None,
+    lang: LangOpt = None,
     as_json: JsonOpt = False,
     pretty: PrettyOpt = False,
 ) -> None:
     """Show upcoming actionable deadlines."""
-    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year, lang=lang)
     _run(state, lambda: deadlines.upcoming_deadlines(days, overdue, state.year), _print_deadlines)
 
 
@@ -404,11 +426,12 @@ def cmd_courses(
     ctx: typer.Context,
     semester: Optional[int] = typer.Option(None, "--semester", "-s", help="Filter by semester (1 or 2)."),
     year: YearOpt = None,
+    lang: LangOpt = None,
     as_json: JsonOpt = False,
     pretty: PrettyOpt = False,
 ) -> None:
     """List your enrolled courses."""
-    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year, lang=lang)
 
     def render(items: list[dict]) -> None:
         if not items:
@@ -437,11 +460,12 @@ def cmd_course(
     query: str = typer.Argument(..., help="Course ID, RUNI course number, or partial course name."),
     view: str = typer.Argument("contents", help="What to show: contents, staff, or grades."),
     year: YearOpt = None,
+    lang: LangOpt = None,
     as_json: JsonOpt = False,
     pretty: PrettyOpt = False,
 ) -> None:
     """Inspect a single course (contents, staff, or grades)."""
-    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year, lang=lang)
     mode = view.lower()
     if mode not in {"contents", "staff", "grades"}:
         _fail(state, "usage", f"view must be one of contents, staff, grades (got {view!r}).", 2)
@@ -496,11 +520,12 @@ def cmd_assignments(
     overdue: bool = typer.Option(False, "--overdue", help="Include past-due assignments."),
     new_only: bool = typer.Option(False, "--new", help="Show assignments added or updated today."),
     year: YearOpt = None,
+    lang: LangOpt = None,
     as_json: JsonOpt = False,
     pretty: PrettyOpt = False,
 ) -> None:
     """List assignments across all courses."""
-    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year, lang=lang)
     if new_only:
         def render_new(res: dict) -> None:
             if res["first_run"]:
@@ -545,11 +570,12 @@ def cmd_assignment(
     ctx: typer.Context,
     assignment_id: int = typer.Argument(..., help="Assignment ID from `runi assignments`."),
     year: YearOpt = None,
+    lang: LangOpt = None,
     as_json: JsonOpt = False,
     pretty: PrettyOpt = False,
 ) -> None:
     """Show full details, submission status, grade, and feedback for one assignment."""
-    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year, lang=lang)
 
     def render(a: dict) -> None:
         console.print(f"[bold cyan]{a['name']}[/bold cyan] ({a['course']})")
@@ -575,11 +601,12 @@ def cmd_grades(
     ctx: typer.Context,
     course: Optional[str] = typer.Argument(None, help="Optional course ID, number, or partial name."),
     year: YearOpt = None,
+    lang: LangOpt = None,
     as_json: JsonOpt = False,
     pretty: PrettyOpt = False,
 ) -> None:
     """Show overall grades across courses, or detailed grade items for one course."""
-    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year, lang=lang)
 
     def fetch() -> dict:
         if course is None:
@@ -620,11 +647,12 @@ def cmd_messages(
     days: int = typer.Option(7, "--days", "-d", help="How many days back to search."),
     course: Optional[str] = typer.Option(None, "--course", "-c", help="Limit to one course (ID, number, or name)."),
     year: YearOpt = None,
+    lang: LangOpt = None,
     as_json: JsonOpt = False,
     pretty: PrettyOpt = False,
 ) -> None:
     """Show announcements, staff forum replies, and direct messages."""
-    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year, lang=lang)
 
     def fetch() -> list[dict]:
         cid = courses.resolve_course(course, state.year)["id"] if course else None
@@ -652,11 +680,12 @@ def cmd_calendar(
     days: int = typer.Option(30, "--days", "-d", help="Days ahead to show."),
     course: Optional[str] = typer.Option(None, "--course", "-c", help="Limit to one course (ID, number, or name)."),
     year: YearOpt = None,
+    lang: LangOpt = None,
     as_json: JsonOpt = False,
     pretty: PrettyOpt = False,
 ) -> None:
     """Show upcoming Moodle calendar events."""
-    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year, lang=lang)
 
     def fetch() -> list[dict]:
         cid = courses.resolve_course(course, state.year)["id"] if course else None
@@ -684,11 +713,12 @@ def cmd_search(
     query: str = typer.Argument(..., help="Search query (Hebrew or English)."),
     page: int = typer.Option(0, "--page", "-p", help="Result page number (0-based)."),
     year: YearOpt = None,
+    lang: LangOpt = None,
     as_json: JsonOpt = False,
     pretty: PrettyOpt = False,
 ) -> None:
     """Search across all your Moodle courses."""
-    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year, lang=lang)
 
     def render(res: dict) -> None:
         console.print(f"Found {res['total']} results (page {res['page']}):")
@@ -737,11 +767,12 @@ def cmd_download(
     section: Optional[str] = typer.Option(None, "--section", help="When downloading a course, only sections matching this text."),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing files instead of skipping."),
     year: YearOpt = None,
+    lang: LangOpt = None,
     as_json: JsonOpt = False,
     pretty: PrettyOpt = False,
 ) -> None:
     """Download a single Moodle file URL or all files from a course."""
-    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year, lang=lang)
 
     if target.startswith(("http://", "https://")):
         def render_one(res: dict) -> None:

@@ -17,10 +17,27 @@ from platformdirs import user_config_dir, user_data_dir
 
 APP_NAME = "runi-moodle-cli"
 DEFAULT_BASE_URL = "https://moodle.runi.ac.il"
+DEFAULT_LANG = "en"
+VALID_LANGS = frozenset({"en", "he", "auto"})
+
+_lang_override: str | None = None
 
 
 class AuthError(RuntimeError):
     """Raised when Moodle authentication is missing or invalid."""
+
+
+def normalize_lang(lang: str) -> str:
+    value = lang.strip().lower()
+    if value not in VALID_LANGS:
+        allowed = ", ".join(sorted(VALID_LANGS))
+        raise ValueError(f"Unsupported language {lang!r}. Choose one of: {allowed}.")
+    return value
+
+
+def set_lang_override(lang: str | None) -> None:
+    global _lang_override
+    _lang_override = normalize_lang(lang) if lang is not None else None
 
 
 @dataclass
@@ -28,6 +45,7 @@ class Site:
     url: str
     token: str
     year: int
+    lang: str | None = DEFAULT_LANG
 
 
 @dataclass
@@ -35,6 +53,7 @@ class Config:
     base_url: str = DEFAULT_BASE_URL
     default_year: int | None = None
     tokens: dict[int, str] = field(default_factory=dict)
+    lang: str = DEFAULT_LANG
 
 
 def current_academic_year(today: date | None = None) -> int:
@@ -66,10 +85,13 @@ def _load_file_config(path: Path) -> Config:
         if v:
             tokens[int(k)] = str(v)
     default_year = raw.get("default_year")
+    raw_lang = raw.get("lang")
+    lang = normalize_lang(str(raw_lang)) if raw_lang else DEFAULT_LANG
     return Config(
         base_url=str(raw.get("base_url") or DEFAULT_BASE_URL).rstrip("/"),
         default_year=int(default_year) if default_year is not None else None,
         tokens=tokens,
+        lang=lang,
     )
 
 
@@ -91,6 +113,9 @@ def load_config() -> Config:
         if env_year.isdigit():
             cfg.default_year = int(env_year)
 
+    if env_lang := os.environ.get("MOODLE_LANG"):
+        cfg.lang = normalize_lang(env_lang)
+
     if cfg.default_year is None and cfg.tokens:
         cfg.default_year = max(cfg.tokens)
 
@@ -104,6 +129,7 @@ def save_config(cfg: Config) -> Path:
     payload = {
         "base_url": cfg.base_url.rstrip("/"),
         "default_year": cfg.default_year,
+        "lang": cfg.lang,
         "tokens": {str(year): token for year, token in sorted(cfg.tokens.items())},
     }
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -115,11 +141,19 @@ def save_config(cfg: Config) -> Path:
     return path
 
 
-def save_token(year: int, token: str, base_url: str | None = None, set_default: bool = True) -> Path:
+def save_token(
+    year: int,
+    token: str,
+    base_url: str | None = None,
+    set_default: bool = True,
+    lang: str | None = None,
+) -> Path:
     """Persist a Moodle mobile token for a specific academic year."""
     cfg = _load_file_config(config_path())
     if base_url:
         cfg.base_url = base_url.rstrip("/")
+    if lang is not None:
+        cfg.lang = normalize_lang(lang)
     cfg.tokens[year] = token.strip()
     if set_default or cfg.default_year is None:
         cfg.default_year = year
@@ -152,7 +186,14 @@ def get_site(year: int | None = None) -> Site:
             f"No Moodle token configured for {target_year}. "
             f"Run `runi auth login --year {target_year}` to sign in."
         )
-    return Site(url=f"{cfg.base_url}/{target_year}", token=cfg.tokens[target_year], year=target_year)
+    effective_lang = _lang_override if _lang_override is not None else cfg.lang
+    api_lang = None if effective_lang == "auto" else effective_lang
+    return Site(
+        url=f"{cfg.base_url}/{target_year}",
+        token=cfg.tokens[target_year],
+        year=target_year,
+        lang=api_lang,
+    )
 
 
 def configured_years() -> list[int]:
