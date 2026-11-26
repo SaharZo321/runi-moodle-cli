@@ -7,6 +7,14 @@ import re
 from datetime import datetime
 
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+BIDI_CONTROL_CHARS = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>[\s\S]*?</\1>", re.I)
+WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+MAX_FILENAME_BYTES = 200
 
 
 def fmt_date(ts: int) -> str | None:
@@ -18,9 +26,14 @@ def fmt_date(ts: int) -> str | None:
 
 def html_to_text(raw: str) -> str:
     """Convert Moodle HTML fragments into clean plain text."""
-    raw = re.sub(r"<br\s*/?>|</p>|</div>|</li>", "\n", raw or "", flags=re.I)
-    raw = html.unescape(re.sub(r"<[^>]+>", "", raw))
-    return re.sub(r"\n\s*\n+", "\n\n", raw).strip()
+    text = SCRIPT_STYLE_RE.sub("", raw or "")
+    text = re.sub(r"<br\s*/?>|</p>|</div>|</li>", "\n", text, flags=re.I)
+    text = html.unescape(re.sub(r"<[^>]+>", "", text))
+    return re.sub(r"\n\s*\n+", "\n\n", text).strip()
+
+
+def unescape_text(raw: str | None) -> str:
+    return html.unescape((raw or "").strip())
 
 
 def browser_url(fileurl: str) -> str:
@@ -33,12 +46,31 @@ def file_list(fileareas: list[dict]) -> list[dict]:
         {"filename": f["filename"], "url": browser_url(f["fileurl"])}
         for area in fileareas
         for f in area.get("files", [])
-        if not f["filename"].startswith("image_page")
+        if f.get("filename") and f.get("fileurl") and not str(f["filename"]).startswith("image_page")
     ]
+
+
+def _truncate_utf8(name: str, max_bytes: int) -> str:
+    encoded = name.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if dot and stem and len(ext.encode("utf-8")) < 20:
+        ext_part = "." + ext
+        budget = max_bytes - len(ext_part.encode("utf-8"))
+        truncated_stem = stem.encode("utf-8")[: max(1, budget)].decode("utf-8", errors="ignore").rstrip(". ")
+        return (truncated_stem or "file") + ext_part
+    return encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip(". ") or "file"
 
 
 def sanitize_filename(name: str, fallback: str = "file") -> str:
     """Make a filename or directory name safe on Windows, macOS, and Linux."""
-    cleaned = INVALID_FILENAME_CHARS.sub("_", (name or "").strip())
+    cleaned = BIDI_CONTROL_CHARS.sub("", name or "")
+    cleaned = INVALID_FILENAME_CHARS.sub("_", cleaned.strip())
     cleaned = cleaned.strip(". ")
-    return cleaned or fallback
+    if not cleaned:
+        return fallback
+    stem = cleaned.split(".", 1)[0].upper()
+    if stem in WINDOWS_RESERVED_NAMES:
+        cleaned = f"_{cleaned}"
+    return _truncate_utf8(cleaned, MAX_FILENAME_BYTES)

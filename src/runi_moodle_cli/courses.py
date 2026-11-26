@@ -6,7 +6,7 @@ import re
 
 from runi_moodle_cli.client import call
 from runi_moodle_cli.config import get_site
-from runi_moodle_cli.formatting import file_list, html_to_text
+from runi_moodle_cli.formatting import file_list, html_to_text, unescape_text
 
 # RUNI short names look like "Computer Networks-592-2026/1 - 2601137":
 # <name>-<course number>-<year>/<semester> - <moodle id>
@@ -33,7 +33,7 @@ def list_courses(semester: int | None = None, year: int | None = None) -> list[d
         match = SHORTNAME.search(c.get("shortname", ""))
         course = {
             "id": c["id"],
-            "name": c.get("fullnamedisplay") or c["fullname"],
+            "name": unescape_text(c.get("fullnamedisplay") or c.get("fullname") or ""),
             "course_number": int(match.group(1)) if match else None,
             "semester": int(match.group(2)) if match else None,
             "url": f"{site.url}/course/view.php?id={c['id']}",
@@ -104,15 +104,26 @@ def get_course_contents(course_id: int, year: int | None = None) -> list[dict]:
         for m in s["modules"]:
             if not m.get("uservisible", True):
                 continue
-            item = {"id": m["id"], "type": m["modname"], "name": m["name"], "url": m.get("url")}
+            item = {
+                "id": m["id"],
+                "type": m.get("modname") or "item",
+                "name": unescape_text(m.get("name") or ""),
+                "url": m.get("url"),
+            }
             if description := html_to_text(m.get("description", "")):
                 item["description"] = description
-            if m["modname"] == "url":
-                item["link"] = next((c["fileurl"] for c in m.get("contents", [])), None)
+            if m.get("modname") == "url":
+                item["link"] = next((c["fileurl"] for c in m.get("contents", []) if c.get("fileurl")), None)
             elif files := file_list([{"files": m.get("contents", [])}]):
                 item["files"] = files
             items.append(item)
         summary = html_to_text(s.get("summary", ""))
         if items or summary:
-            sections.append({"section": s["name"], **({"summary": summary} if summary else {}), "items": items})
+            sections.append(
+                {
+                    "section": unescape_text(s.get("name") or ""),
+                    **({"summary": summary} if summary else {}),
+                    "items": items,
+                }
+            )
     return sections

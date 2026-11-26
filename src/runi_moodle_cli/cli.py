@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +28,7 @@ from runi_moodle_cli import (
     reading,
     search,
 )
-from runi_moodle_cli.client import MoodleError, get_site_info
+from runi_moodle_cli.client import MoodleError, get_site_info, sanitize_http_error
 from runi_moodle_cli.config import (
     AuthError,
     DEFAULT_BASE_URL,
@@ -55,9 +56,20 @@ console = Console()
 err_console = Console(stderr=True)
 
 
+_TERM_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def _clean_term(value: Any) -> str:
+    return _TERM_CONTROL_RE.sub("", str(value))
+
+
+def _esc(value: Any) -> str:
+    return escape_markup(_clean_term(value))
+
+
 def _table(title: str | None = None) -> Table:
     """Create a borderless table (no vertical box lines that misalign with Hebrew RTL fonts)."""
-    return Table(title=title, box=box.SIMPLE_HEAD, pad_edge=False)
+    return Table(title=_esc(title) if title is not None else None, box=box.SIMPLE_HEAD, pad_edge=False)
 
 
 JsonOpt = Annotated[bool, typer.Option("--json", help="Emit JSON output.")]
@@ -141,7 +153,7 @@ def _fail(
             + "\n"
         )
     else:
-        err_console.print(f"[red]Error:[/red] {message}")
+        err_console.print(f"[red]Error:[/red] {_esc(message)}")
     raise typer.Exit(code=exit_code)
 
 
@@ -151,7 +163,7 @@ def _run(
     render_human: Callable[[Any], None],
     *,
     auto_json: bool = True,
-) -> None:
+) -> Any:
     try:
         data = fn()
     except AuthError as exc:
@@ -161,8 +173,15 @@ def _run(
     except MoodleError as exc:
         _fail(state, "moodle", str(exc), 4, auto_json=auto_json)
     except httpx.HTTPError as exc:
-        _fail(state, "network", f"Could not reach Moodle: {exc}", 4, auto_json=auto_json)
+        _fail(state, "network", f"Could not reach Moodle: {sanitize_http_error(exc)}", 4, auto_json=auto_json)
+    except OSError as exc:
+        _fail(state, "io", str(exc), 1, auto_json=auto_json)
+    except (KeyboardInterrupt, typer.Abort):
+        _fail(state, "interrupted", "Cancelled.", 130, auto_json=auto_json)
+    except Exception as exc:
+        _fail(state, "error", str(exc), 1, auto_json=auto_json)
     _emit(state, data, render_human, auto_json=auto_json)
+    return data
 
 
 def _read_secret(prompt_text: str, *, strip_whitespace: bool = True) -> str:
@@ -184,8 +203,14 @@ def _print_deadlines(items: list[dict]) -> None:
     table.add_column("Type", style="dim")
     table.add_column("Status")
     for item in items:
-        status = "[red]OVERDUE[/red]" if item["overdue"] else (item.get("action") or "")
-        table.add_row(item["due"] or "-", item["course"], item["name"], item["type"] or "-", status)
+        status = "[red]OVERDUE[/red]" if item["overdue"] else _esc(item.get("action") or "")
+        table.add_row(
+            _esc(item["due"] or "-"),
+            _esc(item["course"]),
+            _esc(item["name"]),
+            _esc(item["type"] or "-"),
+            status,
+        )
     console.print(table)
 
 
@@ -227,7 +252,7 @@ def auth_login(
     browser: bool = typer.Option(False, "--browser", help="Open a browser window (Playwright) to complete RUNI SSO."),
     cookie: bool = typer.Option(False, "--cookie", help="Exchange a pasted MoodleSession<year> cookie for a long-lived token."),
     token: bool = typer.Option(False, "--token", help="Save a Moodle mobile wstoken (or moodlemobile://token=... URL) directly."),
-    base_url: str = typer.Option(DEFAULT_BASE_URL, "--base-url", help="Moodle base URL."),
+    base_url: Optional[str] = typer.Option(None, "--base-url", help=f"Moodle base URL (defaults to configured URL or {DEFAULT_BASE_URL})."),
     no_default: bool = typer.Option(False, "--no-default", help="Do not make this year the default year."),
     lang: LangOpt = None,
     as_json: JsonOpt = False,
@@ -246,6 +271,7 @@ def auth_login(
         _fail(state, "usage", "--username can only be used with credential login.", 2)
 
     def do_login() -> dict:
+        effective_base = base_url if base_url is not None else load_config().base_url
         if credentials:
             if username is not None:
                 user = username.strip()
@@ -261,29 +287,29 @@ def auth_login(
                         "or pass --username, --cookie, or --token."
                     )
                 user, pw = lines[0].strip(), lines[1]
-            tok, info = auth.login_with_credentials(user, pw, year=target_year, base_url=base_url)
+            tok, info = auth.login_with_credentials(user, pw, year=target_year, base_url=effective_base)
             method = "credentials"
         elif browser:
             if not _wants_json(state):
-                console.print(f"Opening browser to sign in to {base_url.rstrip('/')}/{target_year}...")
-            tok, info = auth.login_with_browser(year=target_year, base_url=base_url)
+                console.print(f"Opening browser to sign in to {_esc(effective_base.rstrip('/'))}/{target_year}...")
+            tok, info = auth.login_with_browser(year=target_year, base_url=effective_base)
             method = "browser"
         elif cookie:
             raw_cookie = _read_secret(f"Paste your MoodleSession{target_year} cookie value")
-            tok, info = auth.exchange_cookie_for_token(raw_cookie, year=target_year, base_url=base_url)
+            tok, info = auth.exchange_cookie_for_token(raw_cookie, year=target_year, base_url=effective_base)
             method = "cookie"
         else:
             raw_token = _read_secret(f"Paste your Moodle mobile token for {target_year}").strip()
             if not raw_token:
                 raise AuthError("Empty Moodle token.")
             tok = auth.parse_mobile_redirect(raw_token) if raw_token.lower().startswith("moodlemobile://") else raw_token
-            info = auth.verify_token(year=target_year, token=tok, base_url=base_url)
+            info = auth.verify_token(year=target_year, token=tok, base_url=effective_base)
             method = "token"
 
         saved_to = save_token(
             year=target_year,
             token=tok,
-            base_url=base_url,
+            base_url=effective_base,
             set_default=not no_default,
             lang=state.lang,
         )
@@ -291,7 +317,7 @@ def auth_login(
             "ok": True,
             "method": method,
             "year": target_year,
-            "site": f"{base_url.rstrip('/')}/{target_year}",
+            "site": f"{effective_base.rstrip('/')}/{target_year}",
             "userid": info.get("userid"),
             "fullname": info.get("fullname"),
             "username": info.get("username"),
@@ -300,10 +326,10 @@ def auth_login(
 
     def render(res: dict) -> None:
         console.print(
-            f"[green]Signed in[/green] as [bold]{res.get('fullname') or res.get('username')}[/bold] "
-            f"(userid {res.get('userid')}) for [cyan]{res['site']}[/cyan] via {res['method']}."
+            f"[green]Signed in[/green] as [bold]{_esc(res.get('fullname') or res.get('username'))}[/bold] "
+            f"(userid {res.get('userid')}) for [cyan]{_esc(res['site'])}[/cyan] via {res['method']}."
         )
-        console.print(f"[dim]Saved long-lived mobile token to {res['config_path']}[/dim]")
+        console.print(f"[dim]Saved long-lived mobile token to {_esc(res['config_path'])}[/dim]")
 
     _run(state, do_login, render)
 
@@ -331,7 +357,10 @@ def auth_status(
             if check:
                 try:
                     info = get_site_info(site=get_site(y))
-                except (AuthError, MoodleError, httpx.HTTPError) as exc:
+                except httpx.HTTPError as exc:
+                    entry["valid"] = False
+                    entry["error"] = sanitize_http_error(exc)
+                except (AuthError, MoodleError) as exc:
                     entry["valid"] = False
                     entry["error"] = str(exc)
                 else:
@@ -361,13 +390,13 @@ def auth_status(
         for row in res["years"]:
             status = "-"
             if "valid" in row:
-                status = "[green]valid[/green]" if row["valid"] else f"[red]invalid[/red] ({row.get('error', '')})"
+                status = "[green]valid[/green]" if row["valid"] else f"[red]invalid[/red] ({_esc(row.get('error', ''))})"
             table.add_row(
                 str(row["year"]),
-                row["url"],
+                _esc(row["url"]),
                 "yes" if row["default"] else "",
                 status,
-                row.get("fullname") or "-",
+                _esc(row.get("fullname") or "-"),
             )
         console.print(table)
 
@@ -447,7 +476,7 @@ def cmd_courses(
                 str(c["id"]),
                 str(c["course_number"]) if c["course_number"] else "-",
                 str(c["semester"]) if c["semester"] else "-",
-                c["name"],
+                _esc(c["name"]),
             )
         console.print(table)
 
@@ -480,35 +509,40 @@ def cmd_course(
 
     def render(data: dict) -> None:
         c = data["course"]
-        console.print(f"[bold cyan]{c['name']}[/bold cyan] [dim](id={c['id']})[/dim]")
+        console.print(f"[bold cyan]{_esc(c['name'])}[/bold cyan] [dim](id={c['id']})[/dim]")
         if mode == "staff":
             table = _table()
             table.add_column("Role", style="cyan")
             table.add_column("Name")
             for s in data["staff"]:
-                table.add_row(s["role"], s["name"])
+                table.add_row(_esc(s["role"]), _esc(s["name"]))
             console.print(table)
         elif mode == "grades":
             g = data["grades"]
             if g.get("total"):
-                console.print(f"Course total: [bold]{g['total']}[/bold]")
+                console.print(f"Course total: [bold]{_esc(g['total'])}[/bold]")
             table = _table()
             table.add_column("Item")
             table.add_column("Grade", style="green")
             table.add_column("Range", style="dim")
             table.add_column("Weight", style="dim")
             for item in g["items"]:
-                table.add_row(item["name"], item["grade"] or "-", item["range"] or "-", item["weight"] or "-")
+                table.add_row(
+                    _esc(item["name"]),
+                    _esc(item["grade"] or "-"),
+                    _esc(item["range"] or "-"),
+                    _esc(item["weight"] or "-"),
+                )
             console.print(table)
         else:
             for sec in data["sections"]:
-                console.print(f"\n[bold]{sec['section']}[/bold]")
+                console.print(f"\n[bold]{_esc(sec['section'])}[/bold]")
                 for item in sec["items"]:
-                    console.print(f"  [{item['type']}] {item['name']}")
+                    console.print(f"  \\[{_esc(item['type'])}] {_esc(item['name'])}")
                     for f in item.get("files", []):
-                        console.print(f"    [dim]- {f['filename']}: {f['url']}[/dim]")
+                        console.print(f"    [dim]- {_esc(f['filename'])}: {_esc(f['url'])}[/dim]")
                     if item.get("link"):
-                        console.print(f"    [dim]-> {item['link']}[/dim]")
+                        console.print(f"    [dim]-> {_esc(item['link'])}[/dim]")
 
     _run(state, fetch, render)
 
@@ -533,11 +567,11 @@ def cmd_assignments(
             if res["new"]:
                 console.print("[bold green]New today:[/bold green]")
                 for a in res["new"]:
-                    console.print(f"  #{a['id']} {a['name']} ({a['course']}) due {a['due'] or '-'}")
+                    console.print(f"  #{a['id']} {_esc(a['name'])} ({_esc(a['course'])}) due {_esc(a['due'] or '-')}")
             if res["updated"]:
                 console.print("[bold yellow]Updated today:[/bold yellow]")
                 for a in res["updated"]:
-                    console.print(f"  #{a['id']} {a['name']} ({a['course']}) due {a['due'] or '-'}")
+                    console.print(f"  #{a['id']} {_esc(a['name'])} ({_esc(a['course'])}) due {_esc(a['due'] or '-')}")
             if not res["new"] and not res["updated"]:
                 console.print("No new or updated assignments today.")
 
@@ -556,9 +590,9 @@ def cmd_assignments(
         if status != "all":
             table.add_column("Status")
         for a in items:
-            row = [str(a["id"]), a["due"] or "-", a["course"], a["name"]]
+            row = [str(a["id"]), _esc(a["due"] or "-"), _esc(a["course"]), _esc(a["name"])]
             if status != "all":
-                row.append(a.get("status", "-"))
+                row.append(_esc(a.get("status", "-")))
             table.add_row(*row)
         console.print(table)
 
@@ -578,20 +612,24 @@ def cmd_assignment(
     state = _state(ctx, as_json=as_json, pretty=pretty, year=year, lang=lang)
 
     def render(a: dict) -> None:
-        console.print(f"[bold cyan]{a['name']}[/bold cyan] ({a['course']})")
-        console.print(f"Due: {a['due'] or '-'}  |  Cutoff: {a['cutoff'] or '-'}")
+        console.print(f"[bold cyan]{_esc(a['name'])}[/bold cyan] ({_esc(a['course'])})")
+        console.print(f"Due: {_esc(a['due'] or '-')}  |  Cutoff: {_esc(a['cutoff'] or '-')}")
         sub = a["submission"]
-        console.print(f"Submission: [bold]{sub['status']}[/bold] (modified: {sub['last_modified'] or '-'})")
+        console.print(
+            f"Submission: [bold]{_esc(sub['status'])}[/bold] (modified: {_esc(sub['last_modified'] or '-')})"
+        )
         if a["grade"]:
-            console.print(f"Grade: [green]{a['grade']}[/green]")
+            console.print(f"Grade: [green]{_esc(a['grade'])}[/green]")
         if a["description"]:
-            console.print(f"\n{a['description']}")
+            console.print()
+            console.print(_clean_term(a["description"]), markup=False, highlight=False, emoji=False)
         if a["attachments"]:
             console.print("\n[bold]Attachments:[/bold]")
             for f in a["attachments"]:
-                console.print(f"  - {f['filename']}: {f['url']}")
+                console.print(f"  - {_esc(f['filename'])}: {_esc(f['url'])}")
         if a["feedback_comments"]:
-            console.print(f"\n[bold]Feedback:[/bold]\n{a['feedback_comments']}")
+            console.print("\n[bold]Feedback:[/bold]")
+            console.print(_clean_term(a["feedback_comments"]), markup=False, highlight=False, emoji=False)
 
     _run(state, lambda: assignments.get_assignment(assignment_id, state.year), render)
 
@@ -623,7 +661,7 @@ def cmd_grades(
             table.add_column("Course")
             table.add_column("Grade", style="green")
             for c in data["courses"]:
-                table.add_row(str(c["course_id"]), c["course"] or "-", c["grade"] or "-")
+                table.add_row(str(c["course_id"]), _esc(c["course"] or "-"), _esc(c["grade"] or "-"))
             console.print(table)
             return
         title = f"Grades: {data.get('course', data['course_id'])}"
@@ -635,7 +673,12 @@ def cmd_grades(
         table.add_column("Range", style="dim")
         table.add_column("Weight", style="dim")
         for item in data["items"]:
-            table.add_row(item["name"], item["grade"] or "-", item["range"] or "-", item["weight"] or "-")
+            table.add_row(
+                _esc(item["name"]),
+                _esc(item["grade"] or "-"),
+                _esc(item["range"] or "-"),
+                _esc(item["weight"] or "-"),
+            )
         console.print(table)
 
     _run(state, fetch, render)
@@ -655,7 +698,7 @@ def cmd_messages(
     state = _state(ctx, as_json=as_json, pretty=pretty, year=year, lang=lang)
 
     def fetch() -> list[dict]:
-        cid = courses.resolve_course(course, state.year)["id"] if course else None
+        cid = courses.resolve_course(course, state.year)["id"] if course is not None else None
         return messages.staff_messages(days, cid, state.year)
 
     def render(items: list[dict]) -> None:
@@ -663,13 +706,13 @@ def cmd_messages(
             console.print(f"No staff messages in the last {days} days.")
             return
         for m in items:
-            header = f"[cyan]{m['time']}[/cyan] [{m['kind']}] [bold]{m.get('author') or 'Staff'}[/bold]"
+            header = f"[cyan]{_esc(m['time'] or '-')}[/cyan] \\[{_esc(m['kind'])}] [bold]{_esc(m.get('author') or 'Staff')}[/bold]"
             if m.get("course"):
-                header += f" in [magenta]{m['course']}[/magenta]"
+                header += f" in [magenta]{_esc(m['course'])}[/magenta]"
             console.print(header)
             if m.get("subject"):
-                console.print(f"  [bold]{m['subject']}[/bold]")
-            console.print(f"  {m['text']}\n")
+                console.print(f"  [bold]{_esc(m['subject'])}[/bold]")
+            console.print(f"  {_clean_term(m['text'])}\n", markup=False, highlight=False, emoji=False)
 
     _run(state, fetch, render)
 
@@ -688,7 +731,7 @@ def cmd_calendar(
     state = _state(ctx, as_json=as_json, pretty=pretty, year=year, lang=lang)
 
     def fetch() -> list[dict]:
-        cid = courses.resolve_course(course, state.year)["id"] if course else None
+        cid = courses.resolve_course(course, state.year)["id"] if course is not None else None
         return calendar.calendar_events(days, cid, state.year)
 
     def render(items: list[dict]) -> None:
@@ -701,7 +744,7 @@ def cmd_calendar(
         table.add_column("Event")
         table.add_column("Type", style="dim")
         for e in items:
-            table.add_row(e["start"] or "-", e["course"] or "-", e["name"], e["type"])
+            table.add_row(_esc(e["start"] or "-"), _esc(e["course"] or "-"), _esc(e["name"]), _esc(e["type"]))
         console.print(table)
 
     _run(state, fetch, render)
@@ -723,11 +766,11 @@ def cmd_search(
     def render(res: dict) -> None:
         console.print(f"Found {res['total']} results (page {res['page']}):")
         for r in res["results"]:
-            console.print(f"  [bold]{r['title']}[/bold] [dim]({r['course']} | {r['kind']})[/dim]")
+            console.print(f"  [bold]{_esc(r['title'])}[/bold] [dim]({_esc(r['course'])} | {_esc(r['kind'])})[/dim]")
             if r["snippet"]:
-                console.print(f"    {r['snippet']}")
+                console.print(f"    {_clean_term(r['snippet'])}", markup=False, highlight=False, emoji=False)
             if r["url"]:
-                console.print(f"    [dim]{r['url']}[/dim]")
+                console.print(f"    [dim]{_esc(r['url'])}[/dim]")
 
     _run(state, lambda: search.search(query, page, state.year), render)
 
@@ -751,8 +794,8 @@ def cmd_read(
             if "next_offset" in res:
                 err_console.print(f"[dim]More text available: rerun with --offset {res['next_offset']}[/dim]")
             return
-        console.print(f"[bold cyan]{escape_markup(res['name'])}[/bold cyan] [dim]({res['total_chars']} chars)[/dim]\n")
-        console.print(res["text"], markup=False, highlight=False, soft_wrap=True, emoji=False)
+        console.print(f"[bold cyan]{_esc(res['name'])}[/bold cyan] [dim]({res['total_chars']} chars)[/dim]\n")
+        console.print(_clean_term(res["text"]), markup=False, highlight=False, soft_wrap=True, emoji=False)
         if "next_offset" in res:
             console.print(f"\n[dim]More text available: rerun with --offset {res['next_offset']}[/dim]")
 
@@ -763,7 +806,7 @@ def cmd_read(
 def cmd_download(
     ctx: typer.Context,
     target: str = typer.Argument(..., help="A Moodle file URL (pluginfile.php) OR a course (ID, number, or name)."),
-    out: Optional[Path] = typer.Option(None, "--out", "-o", help="Destination file or directory."),
+    out: Optional[str] = typer.Option(None, "--out", "-o", help="Destination file or directory."),
     section: Optional[str] = typer.Option(None, "--section", help="When downloading a course, only sections matching this text."),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing files instead of skipping."),
     year: YearOpt = None,
@@ -773,18 +816,24 @@ def cmd_download(
 ) -> None:
     """Download a single Moodle file URL or all files from a course."""
     state = _state(ctx, as_json=as_json, pretty=pretty, year=year, lang=lang)
+    out_path = Path(out) if out is not None else None
+    out_is_dir = bool(out and out.endswith(("/", "\\")))
 
-    if target.startswith(("http://", "https://")):
+    if target.lower().startswith(("http://", "https://")):
         def render_one(res: dict) -> None:
             verb = "Skipped (exists)" if res["skipped"] else "Downloaded"
-            console.print(f"[green]{verb}:[/green] {res['path']} ({res['bytes']} bytes)")
+            console.print(f"[green]{verb}:[/green] {_esc(res['path'])} ({res['bytes']} bytes)")
 
-        _run(state, lambda: reading.download_file(target, dest=out, overwrite=overwrite), render_one)
+        _run(
+            state,
+            lambda: reading.download_file(target, dest=out_path, overwrite=overwrite, dest_is_dir=out_is_dir),
+            render_one,
+        )
         return
 
     def fetch_course() -> dict:
         c = courses.resolve_course(target, state.year)
-        dest_dir = out or (Path.cwd() / sanitize_filename(c["name"], fallback=f"course_{c['id']}"))
+        dest_dir = out_path or (Path.cwd() / sanitize_filename(c["name"], fallback=f"course_{c['id']}"))
         result = reading.download_course_files(
             c["id"],
             dest_dir=dest_dir,
@@ -795,19 +844,27 @@ def cmd_download(
         return {"course": c["name"], "dest": str(dest_dir), **result}
 
     def render_course(res: dict) -> None:
-        console.print(f"[bold cyan]{res['course']}[/bold cyan] -> {res['dest']}")
+        console.print(f"[bold cyan]{_esc(res['course'])}[/bold cyan] -> {_esc(res['dest'])}")
         console.print(
             f"[green]Downloaded:[/green] {len(res['downloaded'])}  "
             f"[yellow]Skipped:[/yellow] {len(res['skipped'])}  "
             f"[red]Errors:[/red] {len(res['errors'])}"
         )
         for err in res["errors"]:
-            err_console.print(f"  [red]Failed[/red] {err['filename']}: {err['error']}")
+            err_console.print(f"  [red]Failed[/red] {_esc(err['filename'])}: {_esc(err['error'])}")
 
-    _run(state, fetch_course, render_course)
+    result = _run(state, fetch_course, render_course)
+    if result and result.get("errors"):
+        raise typer.Exit(code=1)
 
 
 def main() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     app()
 
 

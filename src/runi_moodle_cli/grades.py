@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from runi_moodle_cli.client import call, get_user_id
 from runi_moodle_cli.courses import list_courses
-from runi_moodle_cli.formatting import html_to_text
+from runi_moodle_cli.formatting import html_to_text, unescape_text
 
 
 def _clean(value: str | None) -> str | None:
@@ -20,21 +20,24 @@ def get_grades(course_id: int | None = None, year: int | None = None) -> dict:
         return {
             "courses": [
                 {"course_id": g["courseid"], "course": names.get(g["courseid"]), "grade": _clean(g.get("grade"))}
-                for g in overview["grades"]
+                for g in overview.get("grades", [])
             ]
         }
 
     report = call("gradereport_user_get_grade_items", year=year, courseid=course_id, userid=user_id)
+    usergrades = report.get("usergrades") or []
+    if not usergrades:
+        return {"course_id": course_id, "total": None, "items": []}
     items, total = [], None
-    for i in report["usergrades"][0]["gradeitems"]:
+    for i in usergrades[0].get("gradeitems", []):
         if i.get("gradeishidden"):
             continue
-        if i["itemtype"] == "course":
+        if i.get("itemtype") == "course":
             total = _clean(i.get("gradeformatted"))
             continue
         items.append(
             {
-                "name": i.get("itemname") or "(category total)",
+                "name": unescape_text(i.get("itemname")) or "(category total)",
                 "grade": _clean(i.get("gradeformatted")),
                 "range": _clean(i.get("rangeformatted")),
                 "weight": _clean(i.get("weightformatted")),

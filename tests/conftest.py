@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import respx
 
 from runi_moodle_cli import client
-from runi_moodle_cli.config import Config, save_config
+from runi_moodle_cli.config import Config, save_config, set_lang_override
 
 
 @pytest.fixture(autouse=True)
@@ -15,14 +17,13 @@ def isolated_config(tmp_path, monkeypatch):
     data_dir = tmp_path / "data"
     monkeypatch.setenv("RUNI_MOODLE_CONFIG", str(cfg_file))
     monkeypatch.setenv("RUNI_MOODLE_DATA_DIR", str(data_dir))
-    for key in list(monkeypatch._setitem) if hasattr(monkeypatch, "_setitem") else []:
-        pass
-    monkeypatch.delenv("MOODLE_BASE_URL", raising=False)
-    monkeypatch.delenv("MOODLE_DEFAULT_YEAR", raising=False)
-    monkeypatch.delenv("MOODLE_TOKEN_2027", raising=False)
-    monkeypatch.delenv("MOODLE_TOKEN_2026", raising=False)
+    for key in list(os.environ):
+        if key.startswith("MOODLE_"):
+            monkeypatch.delenv(key, raising=False)
+    set_lang_override(None)
     client._user_id_cache.clear()
     yield cfg_file
+    set_lang_override(None)
 
 
 @pytest.fixture

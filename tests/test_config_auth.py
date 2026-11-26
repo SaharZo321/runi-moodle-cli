@@ -50,6 +50,52 @@ def test_extract_cookie_value_formats():
     assert extract_cookie_value("xyz987") == "xyz987"
     assert extract_cookie_value("MoodleSession2027=xyz987") == "xyz987"
     assert extract_cookie_value("Cookie: GCLB=1; MoodleSession2027=xyz987; foo=bar") == "xyz987"
+    # Prefer the matching year's cookie when multiple years appear in the header
+    assert extract_cookie_value("MoodleSession2026=old; MoodleSession2027=new", year=2027) == "new"
+
+
+def test_config_rejects_http_and_isolates_tokens_on_base_url_override(monkeypatch, tmp_path):
+    save_token(2027, "runi_secret_tok")
+    # Overriding MOODLE_BASE_URL to another origin must NOT leak saved tokens from config.json
+    monkeypatch.setenv("MOODLE_BASE_URL", "https://other.example")
+    cfg = load_config()
+    assert cfg.base_url == "https://other.example"
+    assert cfg.tokens == {}
+
+    # Non-HTTPS MOODLE_BASE_URL is rejected
+    monkeypatch.setenv("MOODLE_BASE_URL", "http://moodle.runi.ac.il")
+    with pytest.raises(AuthError, match="https://"):
+        load_config()
+
+    # Corrupt config.json raises AuthError cleanly (not JSONDecodeError)
+    monkeypatch.delenv("MOODLE_BASE_URL", raising=False)
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not valid json", encoding="utf-8")
+    monkeypatch.setenv("RUNI_MOODLE_CONFIG", str(bad))
+    with pytest.raises(AuthError, match="Could not read config"):
+        load_config()
+
+
+def test_save_config_preserves_existing_parent_dir_permissions(monkeypatch, tmp_path):
+    import os
+    import stat
+
+    if os.name == "nt":
+        return
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir(mode=0o755)
+    os.chmod(shared_dir, 0o755)
+    cfg_file = shared_dir / "config.json"
+    monkeypatch.setenv("RUNI_MOODLE_CONFIG", str(cfg_file))
+
+    save_token(2027, "secret_tok")
+    assert stat.S_IMODE(shared_dir.stat().st_mode) == 0o755
+    assert stat.S_IMODE(cfg_file.stat().st_mode) == 0o600
+
+    # Refuses to silently wipe existing tokens when switching to a different origin
+    with pytest.raises(AuthError, match="already holds tokens"):
+        save_token(2027, "other_tok", base_url="https://other.moodle.example")
+    assert load_config().tokens == {2027: "secret_tok"}
 
 
 def test_parse_mobile_redirect():

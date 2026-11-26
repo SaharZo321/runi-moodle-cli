@@ -11,8 +11,8 @@ from urllib.parse import unquote, urlencode, urljoin, urlparse
 
 import httpx
 
-from runi_moodle_cli.client import get_site_info
-from runi_moodle_cli.config import AuthError, DEFAULT_BASE_URL, Site
+from runi_moodle_cli.client import get_site_info, sanitize_url
+from runi_moodle_cli.config import AuthError, DEFAULT_BASE_URL, Site, normalize_base_url
 
 COOKIE_PAIR_RE = re.compile(r"MoodleSession\d*=([^;\s'\"]+)", re.I)
 MOBILE_TOKEN_LINK_RE = re.compile(r"moodlemobile://token=([A-Za-z0-9+/=%._-]+)", re.I)
@@ -47,7 +47,7 @@ def parse_mobile_redirect(location: str) -> str:
     encoded = unquote(encoded)
     padding = "=" * (-len(encoded) % 4)
     try:
-        decoded = base64.b64decode(encoded + padding).decode("utf-8")
+        decoded = base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
     except Exception as exc:
         raise AuthError("Could not decode the Moodle mobile token payload.") from exc
     parts = decoded.split(":::")
@@ -56,11 +56,15 @@ def parse_mobile_redirect(location: str) -> str:
     return parts[1].strip()
 
 
-def extract_cookie_value(raw: str) -> str:
+def extract_cookie_value(raw: str, year: int | None = None) -> str:
     """Accept a bare cookie value, 'MoodleSession2027=...', or a copied Cookie/cURL string."""
     text = raw.strip()
     if not text:
         raise AuthError("Empty cookie value.")
+    if year is not None:
+        year_match = re.search(rf"\bMoodleSession{year}=([^;\s'\"]+)", text, re.I)
+        if year_match:
+            return year_match.group(1).strip()
     match = COOKIE_PAIR_RE.search(text)
     if match:
         return match.group(1).strip()
@@ -71,7 +75,8 @@ def extract_cookie_value(raw: str) -> str:
 
 def verify_token(year: int, token: str, base_url: str = DEFAULT_BASE_URL) -> dict[str, Any]:
     """Verify a wstoken against Moodle and return core_webservice_get_site_info."""
-    site = Site(url=f"{base_url.rstrip('/')}/{year}", token=token.strip(), year=year)
+    normalized = normalize_base_url(base_url)
+    site = Site(url=f"{normalized}/{year}", token=token.strip(), year=year)
     return get_site_info(site=site)
 
 
@@ -81,9 +86,10 @@ def exchange_cookie_for_token(
     base_url: str = DEFAULT_BASE_URL,
 ) -> tuple[str, dict[str, Any]]:
     """Exchange a browser MoodleSession<year> cookie for a long-lived Moodle mobile wstoken."""
-    cookie_value = extract_cookie_value(cookie_input)
+    normalized = normalize_base_url(base_url)
+    cookie_value = extract_cookie_value(cookie_input, year=year)
     cookie_name = f"MoodleSession{year}"
-    url = launch_url(year=year, base_url=base_url)
+    url = launch_url(year=year, base_url=normalized)
 
     with httpx.Client(
         timeout=30,
@@ -92,20 +98,20 @@ def exchange_cookie_for_token(
     ) as client:
         response = client.get(url)
     location = response.headers.get("location", "")
-    if response.status_code in (301, 302, 303, 307, 308) and location.startswith("moodlemobile://"):
+    if response.status_code in (301, 302, 303, 307, 308) and location.lower().startswith("moodlemobile://"):
         token = parse_mobile_redirect(location)
-        info = verify_token(year=year, token=token, base_url=base_url)
+        info = verify_token(year=year, token=token, base_url=normalized)
         return token, info
 
     if response.status_code in (301, 302, 303, 307, 308) and "login" in location.lower():
         raise AuthError(
             f"The {cookie_name} cookie was rejected or expired (Moodle redirected to login). "
-            f"Make sure you are signed in to {base_url.rstrip('/')}/{year} and copy a fresh {cookie_name} cookie."
+            f"Make sure you are signed in to {normalized}/{year} and copy a fresh {cookie_name} cookie."
         )
 
     raise AuthError(
         f"Unexpected response from Moodle launch endpoint (HTTP {response.status_code}). "
-        f"Make sure {cookie_name} is valid for {base_url.rstrip('/')}/{year}."
+        f"Make sure {cookie_name} is valid for {normalized}/{year}."
     )
 
 
@@ -150,16 +156,7 @@ def _parse_forms(html_text: str) -> list[dict[str, Any]]:
 
 
 def _sanitize_url(url: str | httpx.URL) -> str:
-    parsed = urlparse(str(url))
-    if parsed.scheme and parsed.hostname:
-        host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-        try:
-            port_val = parsed.port
-        except ValueError:
-            port_val = None
-        port = f":{port_val}" if port_val is not None else ""
-        return f"{parsed.scheme}://{host}{port}{parsed.path}"
-    return parsed.path or "<unknown>"
+    return sanitize_url(url)
 
 
 def _origin(url: str | httpx.URL) -> tuple[str, str, int]:
@@ -400,47 +397,52 @@ def login_with_browser(
 ) -> tuple[str, dict[str, Any]]:
     """Open a real browser window via Playwright so the user can complete RUNI SSO,
     then capture the long-lived Moodle mobile wstoken automatically."""
+    normalized = normalize_base_url(base_url)
+    moodle_origin = _origin(normalized)
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise AuthError(
             "Browser login requires Playwright. Install it with:\n"
             '  uv tool install "runi-moodle-cli[browser]"   (or: pip install "runi-moodle-cli[browser]")\n'
-            "  playwright install chromium\n"
-            "Or use `runi auth login --cookie` / `runi auth login --token` instead."
+            "  uvx playwright install chromium\n"
+            "Or use `runi auth login` (interactive credentials) or `--cookie` / `--token` instead."
         ) from exc
 
-    target_url = launch_url(year=year, base_url=base_url)
+    target_url = launch_url(year=year, base_url=normalized)
     captured_location: dict[str, str] = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
-        context = browser.new_context()
-        page = context.new_page()
-
-        def on_response(response: Any) -> None:
-            if "admin/tool/mobile/launch.php" in response.url:
-                loc = response.headers.get("location", "")
-                if loc.startswith("moodlemobile://"):
-                    captured_location["value"] = loc
-
-        page.on("response", on_response)
         try:
-            page.goto(target_url, wait_until="domcontentloaded", timeout=30_000)
-        except Exception:
-            # Some browsers abort navigation when hitting a custom moodlemobile:// scheme
-            pass
+            context = browser.new_context()
+            page = context.new_page()
 
-        elapsed_ms = 0
-        step_ms = 500
-        limit_ms = timeout_seconds * 1000
-        while "value" not in captured_location and elapsed_ms < limit_ms:
-            if page.is_closed():
-                break
-            page.wait_for_timeout(step_ms)
-            elapsed_ms += step_ms
+            def on_response(response: Any) -> None:
+                if _origin(response.url) == moodle_origin and urlparse(response.url).path.endswith(
+                    "/admin/tool/mobile/launch.php"
+                ):
+                    loc = response.headers.get("location", "")
+                    if loc.lower().startswith("moodlemobile://"):
+                        captured_location["value"] = loc
 
-        browser.close()
+            page.on("response", on_response)
+            try:
+                page.goto(target_url, wait_until="domcontentloaded", timeout=30_000)
+            except Exception:
+                # Some browsers abort navigation when hitting a custom moodlemobile:// scheme
+                pass
+
+            elapsed_ms = 0
+            step_ms = 500
+            limit_ms = timeout_seconds * 1000
+            while "value" not in captured_location and elapsed_ms < limit_ms:
+                if page.is_closed():
+                    break
+                page.wait_for_timeout(step_ms)
+                elapsed_ms += step_ms
+        finally:
+            browser.close()
 
     if "value" not in captured_location:
         raise AuthError(
@@ -449,5 +451,5 @@ def login_with_browser(
         )
 
     token = parse_mobile_redirect(captured_location["value"])
-    info = verify_token(year=year, token=token, base_url=base_url)
+    info = verify_token(year=year, token=token, base_url=normalized)
     return token, info

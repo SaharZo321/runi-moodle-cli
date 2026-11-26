@@ -11,12 +11,17 @@ Built on the Moodle API modules from [shanikn/Moodle_MCP](https://github.com/sha
 Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/) (or `pipx` / `pip`):
 
 ```bash
-# Lightweight install (Windows, macOS, Linux)
+# Clone and install globally (Windows, macOS, Linux)
+git clone https://github.com/SaharZo321/runi-moodle-cli.git
+cd runi-moodle-cli
 uv tool install .
+
+# Or install directly from GitHub
+uv tool install git+https://github.com/SaharZo321/runi-moodle-cli.git
 
 # With optional Playwright browser SSO login (--browser)
 uv tool install ".[browser]"
-playwright install chromium
+uvx playwright install chromium
 ```
 
 Both `runi-moodle-cli` and the short alias `runi` are installed.
@@ -52,10 +57,17 @@ runi auth login --year 2027 --token
 ```
 Accepts either a raw `wstoken` or a `moodlemobile://token=...` redirect URL.
 
-Check your saved login anytime:
+### Managing Sessions
 ```bash
+# Check saved logins and verify token validity
 runi auth status
+
+# Remove one year's token, or remove all saved tokens (default when no --year is given)
+runi auth logout --year 2027
+runi auth logout
 ```
+
+> **Security:** Your saved `wstoken` grants full Moodle access like a password and is stored with `0600` permissions on POSIX systems. To revoke it on Moodle's side as well, reset the Moodle mobile web service key under **Preferences -> Security keys**.
 
 ## Usage
 
@@ -99,5 +111,9 @@ runi courses --lang he
 
 - **Network:** Reichman's Moodle (`moodle.runi.ac.il`) requires an Israeli IP address.
 - **Language:** Defaults to `en` (English) for consistent course names and labels. Override with `--lang en|he|auto`, `MOODLE_LANG`, or `lang` in `config.json`.
-- **Config location:** Stored in your OS config folder via `platformdirs` (`~/.config/runi-moodle-cli/config.json` on Linux, `~/Library/Application Support/runi-moodle-cli/config.json` on macOS, `%APPDATA%\runi-moodle-cli\config.json` on Windows). Override with `RUNI_MOODLE_CONFIG`.
-- **Environment variables:** `MOODLE_BASE_URL`, `MOODLE_DEFAULT_YEAR`, `MOODLE_LANG`, and `MOODLE_TOKEN_<year>` are also supported as overrides.
+- **Config location:** Stored in your OS config folder via `platformdirs`:
+  - Linux: `~/.config/runi-moodle-cli/config.json`
+  - macOS: `~/Library/Application Support/runi-moodle-cli/config.json`
+  - Windows: `%LOCALAPPDATA%\runi-moodle-cli\runi-moodle-cli\config.json`
+  - Override with `RUNI_MOODLE_CONFIG`.
+- **Environment variables:** `MOODLE_BASE_URL`, `MOODLE_DEFAULT_YEAR`, `MOODLE_LANG`, and `MOODLE_TOKEN_<year>` are supported as overrides.

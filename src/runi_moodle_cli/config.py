@@ -1,18 +1,19 @@
 """Cross-platform configuration and token storage (Windows, macOS, Linux).
 
 Loads lazily from the user's config file (via platformdirs) with optional
-overrides from environment variables / .env files.
+overrides from environment variables.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlparse
 
-from dotenv import load_dotenv
 from platformdirs import user_config_dir, user_data_dir
 
 APP_NAME = "runi-moodle-cli"
@@ -25,6 +26,31 @@ _lang_override: str | None = None
 
 class AuthError(RuntimeError):
     """Raised when Moodle authentication is missing or invalid."""
+
+
+def normalize_base_url(base_url: str) -> str:
+    cleaned = (base_url or "").strip().rstrip("/")
+    parsed = urlparse(cleaned)
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise AuthError("Moodle base URL must be a valid https:// URL without embedded credentials.")
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise AuthError("Moodle base URL has an invalid port.") from exc
+    return cleaned
+
+
+def _url_origin(url: str) -> tuple[str, str, int]:
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    port = parsed.port if parsed.port is not None else (443 if scheme == "https" else 80)
+    return scheme, host, port
 
 
 def normalize_lang(lang: str) -> str:
@@ -79,16 +105,25 @@ def data_dir() -> Path:
 def _load_file_config(path: Path) -> Config:
     if not path.exists():
         return Config()
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise AuthError(f"Could not read config file {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise AuthError(f"Invalid config file format in {path}.")
     tokens: dict[int, str] = {}
     for k, v in (raw.get("tokens") or {}).items():
         if v:
-            tokens[int(k)] = str(v)
+            try:
+                tokens[int(k)] = str(v)
+            except (TypeError, ValueError):
+                continue
     default_year = raw.get("default_year")
     raw_lang = raw.get("lang")
     lang = normalize_lang(str(raw_lang)) if raw_lang else DEFAULT_LANG
+    base_url = normalize_base_url(str(raw.get("base_url") or DEFAULT_BASE_URL))
     return Config(
-        base_url=str(raw.get("base_url") or DEFAULT_BASE_URL).rstrip("/"),
+        base_url=base_url,
         default_year=int(default_year) if default_year is not None else None,
         tokens=tokens,
         lang=lang,
@@ -96,12 +131,17 @@ def _load_file_config(path: Path) -> Config:
 
 
 def load_config() -> Config:
-    """Load config from disk, then apply .env / environment variable overrides."""
-    load_dotenv()
+    """Load config from disk, then apply environment variable overrides."""
     cfg = _load_file_config(config_path())
+    file_origin = _url_origin(cfg.base_url)
 
     if env_base := os.environ.get("MOODLE_BASE_URL"):
-        cfg.base_url = env_base.rstrip("/")
+        new_base = normalize_base_url(env_base)
+        if _url_origin(new_base) != file_origin:
+            # Never send saved tokens from one origin to a different MOODLE_BASE_URL.
+            cfg.tokens.clear()
+            cfg.default_year = None
+        cfg.base_url = new_base
 
     for key, value in os.environ.items():
         if key.startswith("MOODLE_TOKEN_") and value:
@@ -122,23 +162,43 @@ def load_config() -> Config:
     return cfg
 
 
-def save_config(cfg: Config) -> Path:
-    """Save config to disk with restrictive permissions on POSIX systems."""
-    path = config_path()
+def atomic_write_text(path: Path, text: str, *, private: bool = False) -> Path:
+    """Atomically write UTF-8 text via a temporary file in the same directory."""
+    existed = path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
+    if private and not existed and os.name != "nt":
+        os.chmod(path.parent, 0o700)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        if private and os.name != "nt":
+            try:
+                os.fchmod(fd, 0o600)
+            except Exception:
+                os.close(fd)
+                raise
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def save_config(cfg: Config) -> Path:
+    """Atomically save config to disk with 0600 permissions on POSIX systems."""
+    cfg.base_url = normalize_base_url(cfg.base_url)
+    path = config_path()
     payload = {
-        "base_url": cfg.base_url.rstrip("/"),
+        "base_url": cfg.base_url,
         "default_year": cfg.default_year,
         "lang": cfg.lang,
         "tokens": {str(year): token for year, token in sorted(cfg.tokens.items())},
     }
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    if os.name != "nt":
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-    return path
+    return atomic_write_text(path, json.dumps(payload, indent=2) + "\n", private=True)
 
 
 def save_token(
@@ -151,7 +211,16 @@ def save_token(
     """Persist a Moodle mobile token for a specific academic year."""
     cfg = _load_file_config(config_path())
     if base_url:
-        cfg.base_url = base_url.rstrip("/")
+        normalized = normalize_base_url(base_url)
+        if _url_origin(normalized) != _url_origin(cfg.base_url):
+            if cfg.tokens:
+                raise AuthError(
+                    f"Config already holds tokens for {cfg.base_url}. "
+                    "Run `runi auth logout --all` (or set RUNI_MOODLE_CONFIG to a separate file) "
+                    f"before signing in to {normalized}."
+                )
+            cfg.default_year = None
+        cfg.base_url = normalized
     if lang is not None:
         cfg.lang = normalize_lang(lang)
     cfg.tokens[year] = token.strip()

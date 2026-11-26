@@ -1,16 +1,25 @@
 [project]
 name = "runi-moodle-cli"
-version = "0.1.0"
+version = "1.0.0"
 description = "Lightweight cross-platform CLI for Reichman University (RUNI) Moodle"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
 dependencies = [
     "httpx>=0.28.1",
     "platformdirs>=4.3.0",
     "pypdf>=5.0.0",
     "python-docx>=1.1.0",
-    "python-dotenv>=1.0.1",
     "python-pptx>=1.0.0",
     "rich>=13.9.0",
     "typer>=0.15.0",
@@ -20,6 +29,11 @@ dependencies = [
 browser = [
     "playwright>=1.49.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/SaharZo321/runi-moodle-cli"
+Repository = "https://github.com/SaharZo321/runi-moodle-cli"
+Issues = "https://github.com/SaharZo321/runi-moodle-cli/issues"
 
 [project.scripts]
 runi-moodle-cli = "runi_moodle_cli.cli:main"

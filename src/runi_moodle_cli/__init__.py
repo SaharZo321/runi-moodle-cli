@@ -1,3 +1,8 @@
 """Lightweight cross-platform CLI for Reichman University (RUNI) Moodle."""
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("runi-moodle-cli")
+except PackageNotFoundError:
+    __version__ = "1.0.0"

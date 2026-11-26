@@ -235,3 +235,83 @@ def test_lang_flag_defaults_en_and_supports_he_auto_and_validation(configured_si
 
     r_bad = runner.invoke(app, ["courses", "--lang", "fr", "--json"])
     assert r_bad.exit_code == 2
+
+
+def test_cli_escapes_rich_markup_and_renders_type_tags(monkeypatch):
+    monkeypatch.setattr("runi_moodle_cli.cli._stdout_is_tty", lambda: True)
+    monkeypatch.setattr(
+        "runi_moodle_cli.courses.resolve_course",
+        lambda q, y=None: {"id": 101, "name": "Course [/red][bold]"},
+    )
+    monkeypatch.setattr(
+        "runi_moodle_cli.courses.get_course_contents",
+        lambda cid, y=None: [
+            {
+                "section": "Week [/x]",
+                "items": [{"id": 1, "type": "resource", "name": "Slides [/cyan]", "files": []}],
+            }
+        ],
+    )
+
+    res = runner.invoke(app, ["course", "101", "contents"])
+    assert res.exit_code == 0, res.output
+    assert "[resource]" in res.stdout
+    assert "Slides [/cyan]" in res.stdout
+    assert "Course [/red][bold]" in res.stdout
+
+
+def test_cli_download_batch_exits_1_on_partial_errors(monkeypatch, tmp_path):
+    monkeypatch.setattr("runi_moodle_cli.courses.resolve_course", lambda q, y=None: {"id": 101, "name": "Net"})
+    monkeypatch.setattr(
+        "runi_moodle_cli.reading.download_course_files",
+        lambda cid, dest_dir, year, section_filter, overwrite: {
+            "downloaded": [],
+            "skipped": [],
+            "errors": [{"filename": "bad.pdf", "url": "https://moodle.runi.ac.il/2027/f", "error": "HTTP 404"}],
+        },
+    )
+    res = runner.invoke(app, ["download", "101", "-o", str(tmp_path), "--json"])
+    assert res.exit_code == 1
+    assert json.loads(res.stdout)["errors"][0]["filename"] == "bad.pdf"
+
+
+def test_auth_login_with_env_base_url_saves_token_under_same_origin(monkeypatch):
+    from runi_moodle_cli.config import load_config
+
+    monkeypatch.setenv("MOODLE_BASE_URL", "https://custom.moodle.example")
+    monkeypatch.setattr(
+        "runi_moodle_cli.auth.verify_token",
+        lambda year, token, base_url: {"userid": 3, "fullname": "User", "username": "u"},
+    )
+    res = runner.invoke(app, ["auth", "login", "--year", "2027", "--token", "--json"], input="tok_custom\n")
+    assert res.exit_code == 0, res.stdout
+
+    # Removing MOODLE_BASE_URL must still show the saved token bound to custom.moodle.example, not RUNI
+    monkeypatch.delenv("MOODLE_BASE_URL", raising=False)
+    cfg = load_config()
+    assert cfg.base_url == "https://custom.moodle.example"
+    assert cfg.tokens == {2027: "tok_custom"}
+
+
+def test_read_tty_strips_terminal_escape_sequences(monkeypatch):
+    monkeypatch.setattr("runi_moodle_cli.cli._stdout_is_tty", lambda: True)
+    monkeypatch.setattr(
+        "runi_moodle_cli.reading.read_content",
+        lambda url, offset=0: {"name": "a\x1b]0;bad\x07.pdf", "text": "ok\x1b[31mred\x07", "total_chars": 12},
+    )
+    res = runner.invoke(app, ["read", "https://moodle.runi.ac.il/2027/pluginfile.php/1/a.pdf"])
+    assert res.exit_code == 0, res.output
+    assert "\x1b" not in res.stdout
+    assert "\x07" not in res.stdout
+
+    # Messages text also strips ESC / C1 control sequences
+    monkeypatch.setattr(
+        "runi_moodle_cli.messages.staff_messages",
+        lambda days, cid, year: [
+            {"time": "2026-12-01 10:00", "kind": "direct_message", "author": "Alice", "text": "hi\x1b[2J\x9bthere"}
+        ],
+    )
+    res_msg = runner.invoke(app, ["messages"])
+    assert res_msg.exit_code == 0, res_msg.output
+    assert "\x1b" not in res_msg.stdout and "\x9b" not in res_msg.stdout
+    assert "[direct_message]" in res_msg.stdout
