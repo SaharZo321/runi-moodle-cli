@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import time
 
-from runi_moodle_cli.client import call
-from runi_moodle_cli.config import get_site
-from runi_moodle_cli.courses import list_courses
-from runi_moodle_cli.formatting import fmt_date, html_to_text, unescape_text
+from moodle_cli.client import call
+from moodle_cli.config import get_site
+from moodle_cli.courses import list_courses
+from moodle_cli.formatting import fmt_date, html_to_text, unescape_text
 
 DAY = 86400
 MAX_DESCRIPTION = 500
@@ -24,7 +24,7 @@ def calendar_events(days: int = 30, course_id: int | None = None, year: int | No
     site = get_site(year)
     courses = {c["id"]: c["name"] for c in list_courses(year=year)}
     if course_id is not None and course_id not in courses:
-        raise ValueError(f"Course {course_id} is not one of your courses; run `runi courses` for valid ids.")
+        raise ValueError(f"Course {course_id} is not one of your courses; run `mdl courses` for valid ids.")
     now = int(time.time())
     events = call(
         "core_calendar_get_calendar_events",

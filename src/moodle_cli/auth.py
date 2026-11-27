@@ -11,10 +11,10 @@ from urllib.parse import unquote, urlencode, urljoin, urlparse
 
 import httpx
 
-from runi_moodle_cli.client import get_site_info, sanitize_url
-from runi_moodle_cli.config import AuthError, DEFAULT_BASE_URL, Site, normalize_base_url
+from moodle_cli.client import get_site_info, sanitize_url
+from moodle_cli.config import AuthError, DEFAULT_BASE_URL, Site, normalize_base_url
 
-COOKIE_PAIR_RE = re.compile(r"MoodleSession\d*=([^;\s'\"]+)", re.I)
+COOKIE_PAIR_RE = re.compile(r"\b(MoodleSession[A-Za-z0-9_-]*)=([^;\s'\"]+)", re.I)
 MOBILE_TOKEN_LINK_RE = re.compile(r"moodlemobile://token=([A-Za-z0-9+/=%._-]+)", re.I)
 RUNI_MOODLE_ORIGIN = ("https", "moodle.runi.ac.il", 443)
 RUNI_CREDENTIAL_ORIGINS = frozenset({("https", "my.runi.ac.il", 443)})
@@ -27,7 +27,19 @@ RUNI_SSO_ORIGINS = frozenset(
 )
 
 
-def launch_url(year: int, base_url: str = DEFAULT_BASE_URL, passport: str | None = None) -> str:
+def resolve_site_url(year: int, base_url: str = DEFAULT_BASE_URL, site_url: str | None = None) -> str:
+    if site_url is not None:
+        return normalize_base_url(site_url)
+    return f"{normalize_base_url(base_url)}/{year}"
+
+
+def launch_url(
+    year: int,
+    base_url: str = DEFAULT_BASE_URL,
+    passport: str | None = None,
+    *,
+    site_url: str | None = None,
+) -> str:
     passport = passport or secrets.token_hex(8)
     query = urlencode(
         {
@@ -36,7 +48,8 @@ def launch_url(year: int, base_url: str = DEFAULT_BASE_URL, passport: str | None
             "urlscheme": "moodlemobile",
         }
     )
-    return f"{base_url.rstrip('/')}/{year}/admin/tool/mobile/launch.php?{query}"
+    resolved = resolve_site_url(year, base_url=base_url, site_url=site_url)
+    return f"{resolved}/admin/tool/mobile/launch.php?{query}"
 
 
 def parse_mobile_redirect(location: str) -> str:
@@ -56,27 +69,59 @@ def parse_mobile_redirect(location: str) -> str:
     return parts[1].strip()
 
 
-def extract_cookie_value(raw: str, year: int | None = None) -> str:
-    """Accept a bare cookie value, 'MoodleSession2027=...', or a copied Cookie/cURL string."""
+def extract_cookie_pair(raw: str, year: int | None = None) -> tuple[str | None, str]:
+    """Return (cookie_name_or_None, cookie_value) from a bare value or Cookie header."""
     text = raw.strip()
     if not text:
         raise AuthError("Empty cookie value.")
+    if any(ch in text for ch in ("\r", "\n", "\x00")):
+        raise AuthError("Invalid control character in cookie value.")
     if year is not None:
-        year_match = re.search(rf"\bMoodleSession{year}=([^;\s'\"]+)", text, re.I)
+        year_match = re.search(rf"\b(MoodleSession{year})=([^;\s'\"]+)", text, re.I)
         if year_match:
-            return year_match.group(1).strip()
-    match = COOKIE_PAIR_RE.search(text)
-    if match:
-        return match.group(1).strip()
+            return year_match.group(1), year_match.group(2).strip()
+    exact_match = re.search(r"\b(MoodleSession)=([^;\s'\"]+)", text, re.I)
+    if exact_match:
+        return exact_match.group(1), exact_match.group(2).strip()
+    saw_test_cookie = False
+    for match in COOKIE_PAIR_RE.finditer(text):
+        name, val = match.group(1), match.group(2).strip()
+        if name.lower().startswith("moodlesessiontest"):
+            saw_test_cookie = True
+            continue
+        return name, val
+    if saw_test_cookie:
+        raise AuthError("MoodleSessionTest is a test cookie, not your Moodle session cookie.")
     if "=" in text and " " not in text:
-        return text.split("=", 1)[1].strip()
-    return text
+        name, val = text.split("=", 1)
+        name = name.strip()
+        if name.lower().startswith("moodlesessiontest"):
+            raise AuthError("MoodleSessionTest is a test cookie, not your Moodle session cookie.")
+        val = val.rstrip(";").strip()
+        if not val:
+            raise AuthError("Empty cookie value.")
+        return name or None, val
+    cleaned = text.rstrip(";").strip()
+    if not cleaned:
+        raise AuthError("Empty cookie value.")
+    return None, cleaned
 
 
-def verify_token(year: int, token: str, base_url: str = DEFAULT_BASE_URL) -> dict[str, Any]:
+def extract_cookie_value(raw: str, year: int | None = None) -> str:
+    """Accept a bare cookie value, 'MoodleSession2027=...', or a copied Cookie/cURL string."""
+    return extract_cookie_pair(raw, year=year)[1]
+
+
+def verify_token(
+    year: int,
+    token: str,
+    base_url: str = DEFAULT_BASE_URL,
+    *,
+    site_url: str | None = None,
+) -> dict[str, Any]:
     """Verify a wstoken against Moodle and return core_webservice_get_site_info."""
-    normalized = normalize_base_url(base_url)
-    site = Site(url=f"{normalized}/{year}", token=token.strip(), year=year)
+    resolved = resolve_site_url(year, base_url=base_url, site_url=site_url)
+    site = Site(url=resolved, token=token.strip(), year=year)
     return get_site_info(site=site)
 
 
@@ -84,34 +129,37 @@ def exchange_cookie_for_token(
     cookie_input: str,
     year: int,
     base_url: str = DEFAULT_BASE_URL,
+    *,
+    site_url: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """Exchange a browser MoodleSession<year> cookie for a long-lived Moodle mobile wstoken."""
-    normalized = normalize_base_url(base_url)
-    cookie_value = extract_cookie_value(cookie_input, year=year)
-    cookie_name = f"MoodleSession{year}"
-    url = launch_url(year=year, base_url=normalized)
+    """Exchange a browser MoodleSession cookie for a long-lived Moodle mobile wstoken."""
+    resolved = resolve_site_url(year, base_url=base_url, site_url=site_url)
+    parsed_name, cookie_value = extract_cookie_pair(cookie_input, year=year)
+    cookie_name = parsed_name or (f"MoodleSession{year}" if site_url is None else "MoodleSession")
+    cookies = {cookie_name: cookie_value, "MoodleSession": cookie_value, f"MoodleSession{year}": cookie_value}
+    url = launch_url(year=year, base_url=base_url, site_url=site_url)
 
     with httpx.Client(
         timeout=30,
-        cookies={cookie_name: cookie_value, "MoodleSession": cookie_value},
+        cookies=cookies,
         follow_redirects=False,
     ) as client:
         response = client.get(url)
     location = response.headers.get("location", "")
     if response.status_code in (301, 302, 303, 307, 308) and location.lower().startswith("moodlemobile://"):
         token = parse_mobile_redirect(location)
-        info = verify_token(year=year, token=token, base_url=normalized)
+        info = verify_token(year=year, token=token, base_url=base_url, site_url=site_url)
         return token, info
 
     if response.status_code in (301, 302, 303, 307, 308) and "login" in location.lower():
         raise AuthError(
             f"The {cookie_name} cookie was rejected or expired (Moodle redirected to login). "
-            f"Make sure you are signed in to {normalized}/{year} and copy a fresh {cookie_name} cookie."
+            f"Make sure you are signed in to {resolved} and copy a fresh session cookie."
         )
 
     raise AuthError(
         f"Unexpected response from Moodle launch endpoint (HTTP {response.status_code}). "
-        f"Make sure {cookie_name} is valid for {normalized}/{year}."
+        f"Make sure {cookie_name} is valid for {resolved}."
     )
 
 
@@ -174,8 +222,9 @@ def _validate_base_url_for_credentials(base_url: str) -> tuple[str, str, int]:
     parsed = urlparse(base_url)
     if parsed.username is not None or parsed.password is not None or _origin(base_url) != RUNI_MOODLE_ORIGIN:
         raise AuthError(
-            f"Credential login is only supported for {DEFAULT_BASE_URL} (got {_sanitize_url(base_url)}). "
-            "Use `runi auth login --cookie` or `--token` for custom Moodle URLs."
+            f"Year-based --base-url credential login is only supported for {DEFAULT_BASE_URL} "
+            f"(got {_sanitize_url(base_url)}). "
+            "Use `--site <https://...>` for other Moodle sites, or `--browser` / `--cookie` / `--token`."
         )
     return RUNI_MOODLE_ORIGIN
 
@@ -282,23 +331,76 @@ def _is_f5_auth_failure(response: httpx.Response, forms: list[dict[str, Any]]) -
     return _find_form_with_fields(forms, {"username", "password"}) is not None
 
 
+def _login_with_moodle_token_endpoint(
+    username: str,
+    password: str,
+    year: int,
+    resolved_site: str,
+) -> tuple[str, dict[str, Any]]:
+    """Sign in to a standard Moodle site via /login/token.php over HTTPS (no redirects followed)."""
+    token_url = f"{resolved_site}/login/token.php"
+    with httpx.Client(timeout=30, follow_redirects=False) as client:
+        resp = client.post(
+            token_url,
+            data={"username": username, "password": password, "service": "moodle_mobile_app"},
+        )
+    if resp.status_code != 200:
+        raise AuthError(
+            f"Direct credential login is not supported by {resolved_site} (HTTP {resp.status_code}). "
+            "Use `mdl auth login --browser`, `--cookie`, or `--token` instead."
+        )
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        raise AuthError(
+            f"{resolved_site} did not return a JSON token response (it likely requires SSO). "
+            "Use `mdl auth login --browser`, `--cookie`, or `--token` instead."
+        ) from exc
+    if isinstance(payload, dict) and isinstance(payload.get("token"), str) and payload["token"].strip():
+        token = payload["token"].strip()
+        info = verify_token(year=year, token=token, site_url=resolved_site)
+        return token, info
+    code = str(payload.get("errorcode") or "").lower() if isinstance(payload, dict) else ""
+    if code == "invalidlogin":
+        raise AuthError("Invalid Moodle username or password.")
+    if code in {"servicenotavailable", "enablewsdescription"}:
+        raise AuthError(
+            f"The Moodle Mobile App web service is not enabled on {resolved_site}."
+        )
+    raise AuthError(
+        f"Direct credential login was rejected by {resolved_site}. "
+        "If this site uses university SSO, use `mdl auth login --browser`, `--cookie`, or `--token`."
+    )
+
+
 def login_with_credentials(
     username: str,
     password: str,
     year: int,
     base_url: str = DEFAULT_BASE_URL,
+    *,
+    site_url: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """Sign in via RUNI SAML2 / F5 BIG-IP APM over pure HTTP and return a long-lived mobile wstoken.
+    """Sign in with username/password over HTTPS and return a long-lived mobile wstoken.
 
+    Uses pinned F5 BIG-IP APM + SAML2 for Reichman University (moodle.runi.ac.il),
+    and Moodle's standard /login/token.php endpoint for other HTTPS Moodle sites.
     Credentials are used only in memory for this request and are never stored.
     """
     username = username.strip()
     if not username or not password:
         raise AuthError("Username and password are required.")
 
-    moodle_origin = _validate_base_url_for_credentials(base_url)
-    start_url = launch_url(year=year, base_url=base_url)
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; runi-moodle-cli)"}
+    resolved_site = resolve_site_url(year, base_url=base_url, site_url=site_url)
+    if _origin(resolved_site) != RUNI_MOODLE_ORIGIN:
+        if site_url is None:
+            # --base-url credential login is RUNI-only; non-RUNI sites must use --site.
+            _validate_base_url_for_credentials(base_url)
+        return _login_with_moodle_token_endpoint(username, password, year, resolved_site)
+
+    moodle_origin = _validate_base_url_for_credentials(resolved_site if site_url else base_url)
+    start_url = launch_url(year=year, base_url=base_url, site_url=site_url)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; moodle-cli)"}
 
     def submit_saml_forms(
         client: httpx.Client,
@@ -339,20 +441,20 @@ def login_with_credentials(
         )
         if mobile_loc:
             token = parse_mobile_redirect(mobile_loc)
-            return token, verify_token(year=year, token=token, base_url=base_url)
+            return token, verify_token(year=year, token=token, base_url=base_url, site_url=site_url)
 
         # Handle any pre-login SAMLRequest HTTP-POST binding forms before the credential page.
         resp, mobile_loc = submit_saml_forms(client, resp)
         if mobile_loc:
             token = parse_mobile_redirect(mobile_loc)
-            return token, verify_token(year=year, token=token, base_url=base_url)
+            return token, verify_token(year=year, token=token, base_url=base_url, site_url=site_url)
 
         forms = _parse_forms(resp.text)
         login_form = _find_form_with_fields(forms, {"username", "password"})
         if login_form is None:
             raise AuthError(
                 f"Expected RUNI SSO login form at {_sanitize_url(resp.url)} (HTTP {resp.status_code}), "
-                "but none was found. Try `runi auth login --cookie` or `runi auth login --browser`."
+                "but none was found. Try `mdl auth login --cookie` or `mdl auth login --browser`."
             )
         if login_form["method"] != "post":
             raise AuthError(
@@ -374,19 +476,19 @@ def login_with_credentials(
         )
         if mobile_loc:
             token = parse_mobile_redirect(mobile_loc)
-            return token, verify_token(year=year, token=token, base_url=base_url)
+            return token, verify_token(year=year, token=token, base_url=base_url, site_url=site_url)
 
         resp, mobile_loc = submit_saml_forms(client, resp)
         if mobile_loc:
             token = parse_mobile_redirect(mobile_loc)
-            return token, verify_token(year=year, token=token, base_url=base_url)
+            return token, verify_token(year=year, token=token, base_url=base_url, site_url=site_url)
 
         if _is_f5_auth_failure(resp, _parse_forms(resp.text)):
             raise AuthError("Invalid RUNI username or password.")
 
     raise AuthError(
         f"RUNI SSO did not complete (stopped at {_sanitize_url(resp.url)}, HTTP {resp.status_code}). "
-        "If your account requires MFA or an extra verification step, use `runi auth login --cookie` or `--browser`."
+        "If your account requires MFA or an extra verification step, use `mdl auth login --cookie` or `--browser`."
     )
 
 
@@ -394,22 +496,24 @@ def login_with_browser(
     year: int,
     base_url: str = DEFAULT_BASE_URL,
     timeout_seconds: int = 300,
+    *,
+    site_url: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """Open a real browser window via Playwright so the user can complete RUNI SSO,
+    """Open a real browser window via Playwright so the user can complete SSO,
     then capture the long-lived Moodle mobile wstoken automatically."""
-    normalized = normalize_base_url(base_url)
-    moodle_origin = _origin(normalized)
+    resolved = resolve_site_url(year, base_url=base_url, site_url=site_url)
+    moodle_origin = _origin(resolved)
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise AuthError(
             "Browser login requires Playwright. Install it with:\n"
-            '  uv tool install "runi-moodle-cli[browser]"   (or: pip install "runi-moodle-cli[browser]")\n'
+            '  uv tool install ".[browser]"   (or: uv tool install "git+https://github.com/SaharZo321/runi-moodle-cli.git[browser]")\n'
             "  uvx playwright install chromium\n"
-            "Or use `runi auth login` (interactive credentials) or `--cookie` / `--token` instead."
+            "Or use `mdl auth login` (interactive credentials) or `--cookie` / `--token` instead."
         ) from exc
 
-    target_url = launch_url(year=year, base_url=normalized)
+    target_url = launch_url(year=year, base_url=base_url, site_url=site_url)
     captured_location: dict[str, str] = {}
 
     with sync_playwright() as p:
@@ -447,9 +551,9 @@ def login_with_browser(
     if "value" not in captured_location:
         raise AuthError(
             "Timed out or browser was closed before Moodle returned a mobile token. "
-            "Please try `runi auth login --browser` again."
+            "Please try `mdl auth login --browser` again."
         )
 
     token = parse_mobile_redirect(captured_location["value"])
-    info = verify_token(year=year, token=token, base_url=normalized)
+    info = verify_token(year=year, token=token, base_url=base_url, site_url=site_url)
     return token, info

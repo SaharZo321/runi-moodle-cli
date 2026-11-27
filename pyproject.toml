@@ -1,7 +1,7 @@
 [project]
-name = "runi-moodle-cli"
-version = "1.0.0"
-description = "Lightweight cross-platform CLI for Reichman University (RUNI) Moodle"
+name = "moodle-cli"
+version = "1.1.0"
+description = "Lightweight cross-platform CLI for Moodle (Reichman University and other Moodle sites)"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -36,15 +36,17 @@ Repository = "https://github.com/SaharZo321/runi-moodle-cli"
 Issues = "https://github.com/SaharZo321/runi-moodle-cli/issues"
 
 [project.scripts]
-runi-moodle-cli = "runi_moodle_cli.cli:main"
-runi = "runi_moodle_cli.cli:main"
+mdl = "moodle_cli.cli:main"
+moodle-cli = "moodle_cli.cli:main"
+runi = "moodle_cli.cli:main"
+runi-moodle-cli = "moodle_cli.cli:main"
 
 [build-system]
 requires = ["hatchling>=1.25.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/runi_moodle_cli"]
+packages = ["src/moodle_cli"]
 
 [dependency-groups]
 dev = [

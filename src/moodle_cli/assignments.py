@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 
-from runi_moodle_cli.client import call_site
-from runi_moodle_cli.config import Site, atomic_write_text, data_dir, get_site
-from runi_moodle_cli.formatting import file_list, fmt_date, html_to_text, unescape_text
+from moodle_cli.client import call_site
+from moodle_cli.config import Site, atomic_write_text, config_path, data_dir, get_site
+from moodle_cli.formatting import file_list, fmt_date, html_to_text, unescape_text
 
 STATUSES = ("all", "pending", "submitted")
 
@@ -103,7 +104,9 @@ def get_assignment(assignment_id: int, year: int | None = None) -> dict:
 def new_assignments(year: int | None = None) -> dict:
     site = get_site(year)
     state_dir = data_dir() / "state"
-    state_file = state_dir / f"seen_assignments_{site.year}.json"
+    state_key = f"{config_path().resolve()}\0{site.url}"
+    site_hash = hashlib.sha256(state_key.encode("utf-8")).hexdigest()[:12]
+    state_file = state_dir / f"seen_assignments_{site.year}_{site_hash}.json"
     first_run = not state_file.exists()
     seen: dict = {}
     if not first_run:

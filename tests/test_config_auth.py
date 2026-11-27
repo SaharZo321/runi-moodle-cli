@@ -7,7 +7,7 @@ import base64
 import httpx
 import pytest
 
-from runi_moodle_cli.auth import (
+from moodle_cli.auth import (
     _form_data,
     _parse_forms,
     exchange_cookie_for_token,
@@ -15,11 +15,11 @@ from runi_moodle_cli.auth import (
     login_with_credentials,
     parse_mobile_redirect,
 )
-from runi_moodle_cli.config import AuthError, get_site, load_config, remove_token, save_token
+from moodle_cli.config import AuthError, get_site, load_config, remove_token, save_token
 
 
 def test_missing_config_raises_auth_error():
-    with pytest.raises(AuthError, match="runi auth login"):
+    with pytest.raises(AuthError, match="mdl auth login"):
         get_site()
 
 
@@ -52,6 +52,120 @@ def test_extract_cookie_value_formats():
     assert extract_cookie_value("Cookie: GCLB=1; MoodleSession2027=xyz987; foo=bar") == "xyz987"
     # Prefer the matching year's cookie when multiple years appear in the header
     assert extract_cookie_value("MoodleSession2026=old; MoodleSession2027=new", year=2027) == "new"
+    # Generic MoodleSession cookie names (non-RUNI universities) and skip MoodleSessionTest
+    assert extract_cookie_value("Cookie: foo=1; MoodleSessiontau26=abc_tau") == "abc_tau"
+    assert extract_cookie_value("MoodleSessionTest=ignore; MoodleSession=real_sess") == "real_sess"
+    assert extract_cookie_value("MoodleSession=real_sess;") == "real_sess"
+    with pytest.raises(AuthError, match="Empty"):
+        extract_cookie_value("MoodleSession=")
+    with pytest.raises(AuthError, match="Empty"):
+        extract_cookie_value(";")
+    with pytest.raises(AuthError, match="MoodleSessionTest"):
+        extract_cookie_value("MoodleSessionTest=abc")
+    with pytest.raises(AuthError, match="MoodleSessionTest"):
+        extract_cookie_value("Cookie: foo=1; MoodleSessionTest=abc")
+    with pytest.raises(AuthError, match="control"):
+        extract_cookie_value("abc\r\nX-Injected: 1")
+
+
+def test_moodle_site_url_isolation_bad_site_urls_and_logout_reset(monkeypatch, tmp_path):
+    from moodle_cli.config import DEFAULT_BASE_URL, normalize_lang
+
+    # Multi-segment Moodle language codes work
+    assert normalize_lang("en_us_k12") == "en_us_k12"
+    assert normalize_lang("sr_cr_bo") == "sr_cr_bo"
+
+    # Save RUNI 2027 token, then override MOODLE_SITE_URL to a different path on the same origin
+    save_token(2027, "runi_2027_tok")
+    monkeypatch.setenv("MOODLE_SITE_URL", "https://moodle.runi.ac.il/2026")
+    cfg = load_config()
+    assert cfg.tokens == {}  # Must NOT rebind 2027 token to /2026
+    assert cfg.env_site_url == "https://moodle.runi.ac.il/2026"
+    monkeypatch.delenv("MOODLE_SITE_URL", raising=False)
+
+    # Logout resets base_url back to DEFAULT_BASE_URL
+    remove_token(None)
+    save_token(2027, "other_tok", site_url="https://moodle.other.edu/lms")
+    assert load_config().base_url == "https://moodle.other.edu"
+    remove_token(2027)
+    cfg_after = load_config()
+    assert cfg_after.tokens == {}
+    assert cfg_after.site_urls == {}
+    assert cfg_after.base_url == DEFAULT_BASE_URL
+
+    # Corrupt/bad site_urls entries do not crash load_config()
+    bad_cfg = tmp_path / "bad_sites.json"
+    bad_cfg.write_text(
+        '{"base_url": "https://moodle.runi.ac.il", "tokens": {"2027": "t"}, "site_urls": {"2027": "http://bad"}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MOODLE_CLI_CONFIG", str(bad_cfg))
+    loaded = load_config()
+    assert loaded.site_urls == {}
+    assert loaded.tokens == {2027: "t"}
+
+
+def test_generic_token_endpoint_errors_and_redirect_rejection(moodle_api):
+    # Redirect on /login/token.php is rejected without following
+    evil = moodle_api.post("https://evil.example/steal").mock(return_value=httpx.Response(200))
+    moodle_api.post("https://moodle.other.edu/login/token.php").mock(
+        return_value=httpx.Response(302, headers={"location": "https://evil.example/steal"})
+    )
+    with pytest.raises(AuthError, match="not supported"):
+        login_with_credentials("ada", "secret", year=2027, site_url="https://moodle.other.edu")
+    assert evil.call_count == 0
+
+    # Non-JSON response raises clean SSO hint
+    moodle_api.post("https://moodle.other.edu/login/token.php").mock(
+        return_value=httpx.Response(200, text="<html>SSO page</html>")
+    )
+    with pytest.raises(AuthError, match="SSO"):
+        login_with_credentials("ada", "secret", year=2027, site_url="https://moodle.other.edu")
+
+    # invalidlogin maps to fixed invalid credentials message
+    moodle_api.post("https://moodle.other.edu/login/token.php").mock(
+        return_value=httpx.Response(200, json={"errorcode": "invalidlogin", "error": "bad password: secret"})
+    )
+    with pytest.raises(AuthError, match="Invalid Moodle username or password") as exc_inv:
+        login_with_credentials("ada", "secret", year=2027, site_url="https://moodle.other.edu")
+    assert "secret" not in str(exc_inv.value)
+
+    # Generic error never echoes raw server error or errorcode text (which could reflect credentials)
+    moodle_api.post("https://moodle.other.edu/login/token.php").mock(
+        return_value=httpx.Response(
+            200, json={"errorcode": "echoed_code_secret", "error": "echoed_my_secret_pw"}
+        )
+    )
+    with pytest.raises(AuthError, match="rejected") as exc_gen:
+        login_with_credentials("ada", "echoed_my_secret_pw", year=2027, site_url="https://moodle.other.edu")
+    assert "echoed_my_secret_pw" not in str(exc_gen.value)
+    assert "echoed_code_secret" not in str(exc_gen.value)
+
+
+def test_save_token_base_url_path_change_preserves_existing_year_urls():
+    save_token(2026, "tok_2026", base_url="https://moodle.uni.edu/old")
+    save_token(2027, "tok_2027", base_url="https://moodle.uni.edu/new")
+    assert get_site(2026).url == "https://moodle.uni.edu/old/2026"
+    assert get_site(2027).url == "https://moodle.uni.edu/new/2027"
+
+
+def test_exchange_cookie_for_generic_site_url(moodle_api):
+    payload = base64.b64encode(b"sig:::generic_uni_tok").decode()
+
+    def launch_handler(request: httpx.Request):
+        assert "MoodleSessiontau26=sess_val" in request.headers.get("cookie", "")
+        return httpx.Response(303, headers={"location": f"moodlemobile://token={payload}"})
+
+    moodle_api.get("https://moodle.tau.ac.il/admin/tool/mobile/launch.php").mock(side_effect=launch_handler)
+    moodle_api.post("https://moodle.tau.ac.il/webservice/rest/server.php").mock(
+        return_value=httpx.Response(200, json={"userid": 9, "fullname": "TAU Student", "username": "tau"})
+    )
+
+    tok, info = exchange_cookie_for_token(
+        "MoodleSessiontau26=sess_val", year=2027, site_url="https://moodle.tau.ac.il"
+    )
+    assert tok == "generic_uni_tok"
+    assert info["userid"] == 9
 
 
 def test_config_rejects_http_and_isolates_tokens_on_base_url_override(monkeypatch, tmp_path):
@@ -71,7 +185,7 @@ def test_config_rejects_http_and_isolates_tokens_on_base_url_override(monkeypatc
     monkeypatch.delenv("MOODLE_BASE_URL", raising=False)
     bad = tmp_path / "bad.json"
     bad.write_text("{not valid json", encoding="utf-8")
-    monkeypatch.setenv("RUNI_MOODLE_CONFIG", str(bad))
+    monkeypatch.setenv("MOODLE_CLI_CONFIG", str(bad))
     with pytest.raises(AuthError, match="Could not read config"):
         load_config()
 
@@ -86,7 +200,7 @@ def test_save_config_preserves_existing_parent_dir_permissions(monkeypatch, tmp_
     shared_dir.mkdir(mode=0o755)
     os.chmod(shared_dir, 0o755)
     cfg_file = shared_dir / "config.json"
-    monkeypatch.setenv("RUNI_MOODLE_CONFIG", str(cfg_file))
+    monkeypatch.setenv("MOODLE_CLI_CONFIG", str(cfg_file))
 
     save_token(2027, "secret_tok")
     assert stat.S_IMODE(shared_dir.stat().st_mode) == 0o755
