@@ -5,9 +5,9 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from runi_moodle_cli.client import MoodleError, call, get_user_id
-from runi_moodle_cli.courses import get_course_staff, list_courses
-from runi_moodle_cli.formatting import fmt_date, html_to_text, unescape_text
+from moodle_cli.client import MoodleError, call, get_user_id
+from moodle_cli.courses import get_course_staff, list_courses
+from moodle_cli.formatting import fmt_date, html_to_text, unescape_text
 
 MAX_TEXT = 2000
 MAX_DISCUSSION_PAGES = 20

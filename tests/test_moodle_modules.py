@@ -13,7 +13,7 @@ from docx import Document
 from pptx import Presentation
 from pypdf import PdfWriter
 
-from runi_moodle_cli import (
+from moodle_cli import (
     assignments,
     calendar,
     client,
@@ -25,7 +25,7 @@ from runi_moodle_cli import (
     reading,
     search,
 )
-from runi_moodle_cli.config import AuthError
+from moodle_cli.config import AuthError
 
 
 def _mock_courses(moodle_api):
@@ -387,7 +387,13 @@ def test_assignments_deadlines_calendar_grades_messages_search(configured_site, 
         if "mod_forum_get_forum_discussions" in body:
             return httpx.Response(200, json={"discussions": [{"discussion": 77, "timemodified": now_ts, "created": now_ts, "numreplies": 1, "pinned": False}]})
         if "core_enrol_get_enrolled_users" in body:
-            return httpx.Response(200, json=[{"id": 99, "fullname": "Prof X", "roles": [{"shortname": "editingteacher"}]}])
+            return httpx.Response(
+                200,
+                json=[
+                    {"id": 99, "fullname": "Prof X", "roles": [{"shortname": "editingteacher"}]},
+                    {"id": 100, "fullname": "TA Y", "roles": [{"shortname": "noneditingteacher"}]},
+                ],
+            )
         if "mod_forum_get_discussion_posts" in body:
             return httpx.Response(
                 200,
@@ -427,9 +433,77 @@ def test_assignments_deadlines_calendar_grades_messages_search(configured_site, 
     msgs = messages.staff_messages(days=7)
     assert len(msgs) == 1 and msgs[0]["subject"] == "Update"
 
+    # Course staff includes noneditingteacher as TA
+    staff = courses.get_course_staff(101)
+    assert any(s["name"] == "TA Y" and s["role"] == "TA" for s in staff)
+
     # Search validation & results
     with pytest.raises(ValueError, match="empty"):
         search.search("   ")
     with pytest.raises(ValueError, match="page"):
         search.search("hw", page=-1)
     assert search.search("hw")["total"] == 1
+
+
+def test_reading_site_year_prefers_longest_prefix_and_default_year():
+    from moodle_cli.config import Config, save_config
+
+    save_config(
+        Config(
+            base_url="https://moodle.uni.edu",
+            default_year=2027,
+            tokens={2025: "tok_root_old", 2026: "tok_nested", 2027: "tok_root_new"},
+            site_urls={
+                2025: "https://moodle.uni.edu",
+                2026: "https://moodle.uni.edu/moodle",
+                2027: "https://moodle.uni.edu",
+            },
+        )
+    )
+    # Nested /moodle/ path beats root / even though 2027 is default_year
+    assert reading._site_year("https://moodle.uni.edu/moodle/pluginfile.php/1/a.pdf") == 2026
+    # On tied root /, default_year (2027) beats older year (2025)
+    assert reading._site_year("https://moodle.uni.edu/pluginfile.php/1/a.pdf") == 2027
+    # Explicit preferred_year overrides default_year
+    assert reading._site_year("https://moodle.uni.edu/pluginfile.php/1/a.pdf", preferred_year=2025) == 2025
+
+
+def test_new_assignments_isolates_state_per_site_url(monkeypatch, moodle_api, tmp_path):
+    from moodle_cli.config import save_token
+
+    now_ts = int(time.time())
+    future_ts = now_ts + 86400 * 3
+    assign_payload = {
+        "courses": [
+            {
+                "id": 101,
+                "fullname": "CS",
+                "assignments": [
+                    {"id": 50, "cmid": 500, "name": "HW 1", "duedate": future_ts, "cutoffdate": 0, "timemodified": now_ts, "teamsubmission": 0}
+                ],
+            }
+        ]
+    }
+    moodle_api.post("https://moodle.alpha.edu/webservice/rest/server.php").mock(
+        return_value=httpx.Response(200, json=assign_payload)
+    )
+    moodle_api.post("https://moodle.beta.edu/webservice/rest/server.php").mock(
+        return_value=httpx.Response(200, json=assign_payload)
+    )
+
+    monkeypatch.setenv("MOODLE_CLI_CONFIG", str(tmp_path / "alpha.json"))
+    save_token(2027, "tok_alpha", site_url="https://moodle.alpha.edu")
+    first_alpha = assignments.new_assignments(year=2027)
+    assert first_alpha["first_run"] is True
+
+    # Separate university config sharing the same MOODLE_CLI_DATA_DIR must still get its own first_run baseline
+    monkeypatch.setenv("MOODLE_CLI_CONFIG", str(tmp_path / "beta.json"))
+    save_token(2027, "tok_beta", site_url="https://moodle.beta.edu")
+    first_beta = assignments.new_assignments(year=2027)
+    assert first_beta["first_run"] is True
+
+    # Separate account config on the SAME site and year sharing MOODLE_CLI_DATA_DIR must also get its own baseline
+    monkeypatch.setenv("MOODLE_CLI_CONFIG", str(tmp_path / "alpha_second_account.json"))
+    save_token(2027, "tok_alpha_2", site_url="https://moodle.alpha.edu")
+    first_alpha_2 = assignments.new_assignments(year=2027)
+    assert first_alpha_2["first_run"] is True

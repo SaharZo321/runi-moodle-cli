@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from runi_moodle_cli.client import call
-from runi_moodle_cli.formatting import fmt_date, html_to_text
+from moodle_cli.client import call
+from moodle_cli.formatting import fmt_date, html_to_text
 
 SNIPPET = 300
 

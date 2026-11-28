@@ -7,19 +7,19 @@ import os
 import pytest
 import respx
 
-from runi_moodle_cli import client
-from runi_moodle_cli.config import Config, save_config, set_lang_override
+from moodle_cli import client
+from moodle_cli.config import Config, save_config, set_lang_override
 
 
 @pytest.fixture(autouse=True)
 def isolated_config(tmp_path, monkeypatch):
-    cfg_file = tmp_path / "config.json"
-    data_dir = tmp_path / "data"
-    monkeypatch.setenv("RUNI_MOODLE_CONFIG", str(cfg_file))
-    monkeypatch.setenv("RUNI_MOODLE_DATA_DIR", str(data_dir))
     for key in list(os.environ):
         if key.startswith("MOODLE_"):
             monkeypatch.delenv(key, raising=False)
+    cfg_file = tmp_path / "config.json"
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("MOODLE_CLI_CONFIG", str(cfg_file))
+    monkeypatch.setenv("MOODLE_CLI_DATA_DIR", str(data_dir))
     set_lang_override(None)
     client._user_id_cache.clear()
     yield cfg_file

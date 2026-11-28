@@ -1,4 +1,4 @@
-"""Typer + Rich CLI for Reichman University (RUNI) Moodle."""
+"""Typer + Rich CLI for Moodle (Reichman University and other Moodle sites)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Callable, Optional
+from urllib.parse import urlparse
 
 import httpx
 import typer
@@ -16,7 +17,7 @@ from rich.console import Console
 from rich.markup import escape as escape_markup
 from rich.table import Table
 
-from runi_moodle_cli import (
+from moodle_cli import (
     __version__,
     assignments,
     auth,
@@ -28,10 +29,11 @@ from runi_moodle_cli import (
     reading,
     search,
 )
-from runi_moodle_cli.client import MoodleError, get_site_info, sanitize_http_error
-from runi_moodle_cli.config import (
+from moodle_cli.client import MoodleError, get_site_info, sanitize_http_error
+from moodle_cli.config import (
     AuthError,
     DEFAULT_BASE_URL,
+    check_origin_conflict,
     config_path,
     current_academic_year,
     get_site,
@@ -40,12 +42,13 @@ from runi_moodle_cli.config import (
     remove_token,
     save_token,
     set_lang_override,
+    site_url_for_year,
 )
-from runi_moodle_cli.formatting import sanitize_filename
+from moodle_cli.formatting import sanitize_filename
 
 app = typer.Typer(
-    name="runi",
-    help="Lightweight cross-platform CLI for Reichman University (RUNI) Moodle.",
+    name="mdl",
+    help="Lightweight cross-platform CLI for Moodle (Reichman University and other Moodle sites).",
     no_args_is_help=False,
     add_completion=False,
 )
@@ -75,7 +78,7 @@ def _table(title: str | None = None) -> Table:
 JsonOpt = Annotated[bool, typer.Option("--json", help="Emit JSON output.")]
 PrettyOpt = Annotated[bool, typer.Option("--pretty", help="Pretty-print JSON output.")]
 YearOpt = Annotated[Optional[int], typer.Option("--year", "-y", help="Academic year (e.g. 2027). Defaults to configured default.")]
-LangOpt = Annotated[Optional[str], typer.Option("--lang", help="Moodle language: en (default), he, or auto (profile default).")]
+LangOpt = Annotated[Optional[str], typer.Option("--lang", help="Moodle language code (e.g. en, he, ar, de, fr) or 'auto' (profile default).")]
 
 
 @dataclass
@@ -224,7 +227,7 @@ def root(
     version: bool = typer.Option(False, "--version", "-V", help="Show version and exit."),
 ) -> None:
     if version:
-        console.print(f"runi-moodle-cli {__version__}")
+        console.print(f"moodle-cli {__version__}")
         raise typer.Exit()
 
     state = GlobalState(year=year, as_json=as_json or pretty, pretty=pretty)
@@ -247,18 +250,19 @@ def root(
 def auth_login(
     ctx: typer.Context,
     year: Optional[int] = typer.Option(None, "--year", "-y", help="Academic year (defaults to current academic year)."),
-    credentials: bool = typer.Option(False, "--credentials", help="Sign in interactively with RUNI username and password (default)."),
-    username: Optional[str] = typer.Option(None, "--username", "-u", help="RUNI username for credential login."),
-    browser: bool = typer.Option(False, "--browser", help="Open a browser window (Playwright) to complete RUNI SSO."),
-    cookie: bool = typer.Option(False, "--cookie", help="Exchange a pasted MoodleSession<year> cookie for a long-lived token."),
+    credentials: bool = typer.Option(False, "--credentials", help="Sign in interactively with Moodle username and password (default)."),
+    username: Optional[str] = typer.Option(None, "--username", "-u", help="Moodle username for credential login."),
+    browser: bool = typer.Option(False, "--browser", help="Open a browser window (Playwright) to complete Moodle SSO."),
+    cookie: bool = typer.Option(False, "--cookie", help="Exchange a pasted MoodleSession cookie for a long-lived token."),
     token: bool = typer.Option(False, "--token", help="Save a Moodle mobile wstoken (or moodlemobile://token=... URL) directly."),
-    base_url: Optional[str] = typer.Option(None, "--base-url", help=f"Moodle base URL (defaults to configured URL or {DEFAULT_BASE_URL})."),
+    site: Optional[str] = typer.Option(None, "--site", help="Full Moodle site URL for non-RUNI universities (e.g. https://moodle.uni.edu)."),
+    base_url: Optional[str] = typer.Option(None, "--base-url", help=f"Year-based Moodle base URL (defaults to configured URL or {DEFAULT_BASE_URL})."),
     no_default: bool = typer.Option(False, "--no-default", help="Do not make this year the default year."),
     lang: LangOpt = None,
     as_json: JsonOpt = False,
     pretty: PrettyOpt = False,
 ) -> None:
-    """Sign in to Reichman Moodle and save a long-lived Mobile App token."""
+    """Sign in to Moodle and save a long-lived Mobile App token."""
     state = _state(ctx, as_json=as_json, pretty=pretty, lang=lang)
     target_year = year or state.year or current_academic_year()
 
@@ -269,16 +273,37 @@ def auth_login(
         credentials = True
     if username is not None and not credentials:
         _fail(state, "usage", "--username can only be used with credential login.", 2)
+    if site is not None and base_url is not None:
+        _fail(state, "usage", "Pass either --site or --base-url, not both.", 2)
 
     def do_login() -> dict:
-        effective_base = base_url if base_url is not None else load_config().base_url
+        cfg = load_config()
+        effective_site = site
+        explicit_site = site is not None
+        effective_base = base_url if base_url is not None else cfg.base_url
+        if effective_site is None and base_url is None:
+            if cfg.env_site_url is not None:
+                effective_site = cfg.env_site_url
+                explicit_site = True
+            elif target_year in cfg.site_urls:
+                effective_site = cfg.site_urls[target_year]
+            elif target_year not in cfg.tokens and cfg.default_site_url:
+                effective_site = cfg.default_site_url
+
+        resolved_site = auth.resolve_site_url(target_year, base_url=effective_base, site_url=effective_site)
+        check_origin_conflict(
+            base_url=None if effective_site else effective_base,
+            site_url=effective_site,
+        )
+        host_label = urlparse(resolved_site).hostname or resolved_site
+
         if credentials:
             if username is not None:
                 user = username.strip()
-                pw = _read_secret("RUNI password", strip_whitespace=False)
+                pw = _read_secret(f"Moodle password ({host_label})", strip_whitespace=False)
             elif _stdin_is_tty():
-                user = typer.prompt("RUNI username", err=True).strip()
-                pw = typer.prompt("RUNI password", hide_input=True, err=True)
+                user = typer.prompt(f"Moodle username ({host_label})", err=True).strip()
+                pw = typer.prompt(f"Moodle password ({host_label})", hide_input=True, err=True)
             else:
                 lines = sys.stdin.read().splitlines()
                 if len(lines) < 2:
@@ -287,37 +312,48 @@ def auth_login(
                         "or pass --username, --cookie, or --token."
                     )
                 user, pw = lines[0].strip(), lines[1]
-            tok, info = auth.login_with_credentials(user, pw, year=target_year, base_url=effective_base)
+            tok, info = auth.login_with_credentials(
+                user, pw, year=target_year, base_url=effective_base, site_url=effective_site
+            )
             method = "credentials"
         elif browser:
             if not _wants_json(state):
-                console.print(f"Opening browser to sign in to {_esc(effective_base.rstrip('/'))}/{target_year}...")
-            tok, info = auth.login_with_browser(year=target_year, base_url=effective_base)
+                console.print(f"Opening browser to sign in to {_esc(resolved_site)}...")
+            tok, info = auth.login_with_browser(year=target_year, base_url=effective_base, site_url=effective_site)
             method = "browser"
         elif cookie:
-            raw_cookie = _read_secret(f"Paste your MoodleSession{target_year} cookie value")
-            tok, info = auth.exchange_cookie_for_token(raw_cookie, year=target_year, base_url=effective_base)
+            cookie_prompt = (
+                f"Paste your MoodleSession cookie (name=value, or bare value) for {host_label}"
+                if effective_site
+                else f"Paste your MoodleSession{target_year} cookie value"
+            )
+            raw_cookie = _read_secret(cookie_prompt)
+            tok, info = auth.exchange_cookie_for_token(
+                raw_cookie, year=target_year, base_url=effective_base, site_url=effective_site
+            )
             method = "cookie"
         else:
-            raw_token = _read_secret(f"Paste your Moodle mobile token for {target_year}").strip()
+            raw_token = _read_secret(f"Paste your Moodle mobile token for {resolved_site}").strip()
             if not raw_token:
                 raise AuthError("Empty Moodle token.")
             tok = auth.parse_mobile_redirect(raw_token) if raw_token.lower().startswith("moodlemobile://") else raw_token
-            info = auth.verify_token(year=target_year, token=tok, base_url=effective_base)
+            info = auth.verify_token(year=target_year, token=tok, base_url=effective_base, site_url=effective_site)
             method = "token"
 
         saved_to = save_token(
             year=target_year,
             token=tok,
-            base_url=effective_base,
+            base_url=None if effective_site else effective_base,
             set_default=not no_default,
             lang=state.lang,
+            site_url=effective_site,
+            set_default_site=explicit_site,
         )
         return {
             "ok": True,
             "method": method,
             "year": target_year,
-            "site": f"{effective_base.rstrip('/')}/{target_year}",
+            "site": resolved_site,
             "userid": info.get("userid"),
             "fullname": info.get("fullname"),
             "username": info.get("username"),
@@ -351,7 +387,7 @@ def auth_status(
         for y, tok in sorted(cfg.tokens.items()):
             entry: dict[str, Any] = {
                 "year": y,
-                "url": f"{cfg.base_url}/{y}",
+                "url": site_url_for_year(cfg, y),
                 "default": y == cfg.default_year,
             }
             if check:
@@ -378,7 +414,7 @@ def auth_status(
     def render(res: dict) -> None:
         if not res["years"]:
             console.print(
-                f"[yellow]Not signed in.[/yellow] Run `runi auth login --year {current_academic_year()}`."
+                f"[yellow]Not signed in.[/yellow] Run `mdl auth login --year {current_academic_year()}`."
             )
             return
         table = _table(f"Moodle Auth ({res['config_path']})")
@@ -602,7 +638,7 @@ def cmd_assignments(
 @app.command("assignment")
 def cmd_assignment(
     ctx: typer.Context,
-    assignment_id: int = typer.Argument(..., help="Assignment ID from `runi assignments`."),
+    assignment_id: int = typer.Argument(..., help="Assignment ID from `mdl assignments`."),
     year: YearOpt = None,
     lang: LangOpt = None,
     as_json: JsonOpt = False,
@@ -780,11 +816,12 @@ def cmd_read(
     ctx: typer.Context,
     url: str = typer.Argument(..., help="Moodle file URL (pluginfile.php) or Page URL."),
     offset: int = typer.Option(0, "--offset", help="Character offset for long documents."),
+    year: YearOpt = None,
     as_json: JsonOpt = False,
     pretty: PrettyOpt = False,
 ) -> None:
     """Extract and print text from a Moodle file (PDF, PPTX, DOCX, ipynb, HTML/text) or Page."""
-    state = _state(ctx, as_json=as_json, pretty=pretty)
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year)
 
     def render(res: dict) -> None:
         if not _stdout_is_tty():
@@ -799,7 +836,7 @@ def cmd_read(
         if "next_offset" in res:
             console.print(f"\n[dim]More text available: rerun with --offset {res['next_offset']}[/dim]")
 
-    _run(state, lambda: reading.read_content(url, offset), render, auto_json=False)
+    _run(state, lambda: reading.read_content(url, offset, year=state.year), render, auto_json=False)
 
 
 @app.command("download")
@@ -826,7 +863,9 @@ def cmd_download(
 
         _run(
             state,
-            lambda: reading.download_file(target, dest=out_path, overwrite=overwrite, dest_is_dir=out_is_dir),
+            lambda: reading.download_file(
+                target, dest=out_path, overwrite=overwrite, dest_is_dir=out_is_dir, year=state.year
+            ),
             render_one,
         )
         return

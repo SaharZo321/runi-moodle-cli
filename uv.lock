@@ -337,6 +337,50 @@ wheels = [
 ]
 
 [[package]]
+name = "moodle-cli"
+version = "1.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "httpx" },
+    { name = "platformdirs" },
+    { name = "pypdf" },
+    { name = "python-docx" },
+    { name = "python-pptx" },
+    { name = "rich" },
+    { name = "typer" },
+]
+
+[package.optional-dependencies]
+browser = [
+    { name = "playwright" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "respx" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.28.1" },
+    { name = "platformdirs", specifier = ">=4.3.0" },
+    { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.49.0" },
+    { name = "pypdf", specifier = ">=5.0.0" },
+    { name = "python-docx", specifier = ">=1.1.0" },
+    { name = "python-pptx", specifier = ">=1.0.0" },
+    { name = "rich", specifier = ">=13.9.0" },
+    { name = "typer", specifier = ">=0.15.0" },
+]
+provides-extras = ["browser"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8.3.0" },
+    { name = "respx", specifier = ">=0.22.0" },
+]
+
+[[package]]
 name = "packaging"
 version = "26.4"
 source = { registry = "https://pypi.org/simple" }
@@ -708,50 +752,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c0/8f/0722ca900cc807c13a6a0c696dacf35430f72e0ec571c4275d2371fca3e9/rich-15.0.0.tar.gz", hash = "sha256:edd07a4824c6b40189fb7ac9bc4c52536e9780fbbfbddf6f1e2502c31b068c36", size = 230680, upload-time = "2026-04-12T08:24:00.75Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/82/3b/64d4899d73f91ba49a8c18a8ff3f0ea8f1c1d75481760df8c68ef5235bf5/rich-15.0.0-py3-none-any.whl", hash = "sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb", size = 310654, upload-time = "2026-04-12T08:24:02.83Z" },
-]
-
-[[package]]
-name = "runi-moodle-cli"
-version = "1.0.0"
-source = { editable = "." }
-dependencies = [
-    { name = "httpx" },
-    { name = "platformdirs" },
-    { name = "pypdf" },
-    { name = "python-docx" },
-    { name = "python-pptx" },
-    { name = "rich" },
-    { name = "typer" },
-]
-
-[package.optional-dependencies]
-browser = [
-    { name = "playwright" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "respx" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "httpx", specifier = ">=0.28.1" },
-    { name = "platformdirs", specifier = ">=4.3.0" },
-    { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.49.0" },
-    { name = "pypdf", specifier = ">=5.0.0" },
-    { name = "python-docx", specifier = ">=1.1.0" },
-    { name = "python-pptx", specifier = ">=1.0.0" },
-    { name = "rich", specifier = ">=13.9.0" },
-    { name = "typer", specifier = ">=0.15.0" },
-]
-provides-extras = ["browser"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8.3.0" },
-    { name = "respx", specifier = ">=0.22.0" },
 ]
 
 [[package]]

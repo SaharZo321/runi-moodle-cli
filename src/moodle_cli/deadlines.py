@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import time
 
-from runi_moodle_cli.client import call
-from runi_moodle_cli.formatting import fmt_date, html_to_text, unescape_text
+from moodle_cli.client import call
+from moodle_cli.formatting import fmt_date, html_to_text, unescape_text
 
 DAY = 86400
 PAGE_SIZE = 50

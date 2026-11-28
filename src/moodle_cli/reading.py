@@ -19,10 +19,10 @@ from docx import Document
 from pptx import Presentation
 from pypdf import PdfReader
 
-from runi_moodle_cli.client import MoodleError, _http, call, sanitize_http_error, sanitize_url
-from runi_moodle_cli.config import AuthError, configured_years, get_site
-from runi_moodle_cli.courses import get_course_contents
-from runi_moodle_cli.formatting import MAX_FILENAME_BYTES, html_to_text, sanitize_filename, unescape_text
+from moodle_cli.client import MoodleError, _http, call, sanitize_http_error, sanitize_url
+from moodle_cli.config import AuthError, configured_years, get_site, load_config
+from moodle_cli.courses import get_course_contents
+from moodle_cli.formatting import MAX_FILENAME_BYTES, html_to_text, sanitize_filename, unescape_text
 
 MAX_CHARS = 30_000
 MAX_READ_BYTES = 25 * 1024 * 1024
@@ -45,9 +45,10 @@ def _origin(url: str | httpx.URL) -> tuple[str, str, int]:
     return scheme, host, port
 
 
-def _site_year(url: str) -> int:
+def _site_year(url: str, preferred_year: int | None = None) -> int:
     """Resolve which configured year's Moodle site a URL belongs to.
-    Tokens are only ever sent to a configured HTTPS Moodle origin/year."""
+    Tokens are only ever sent to a configured HTTPS Moodle origin/path,
+    preferring the most specific matching path and then preferred/default/latest year."""
     parsed = urlparse(url)
     decoded_path = unquote(parsed.path or "/")
     if (
@@ -59,19 +60,24 @@ def _site_year(url: str) -> int:
     ):
         raise ValueError(
             "Only https:// links to your configured Moodle site can be accessed "
-            "(e.g. file URLs from `runi course <course> contents`)."
+            "(e.g. file URLs from `mdl course <course> contents`)."
         )
     req_origin = _origin(url)
     norm_path = posixpath.normpath(decoded_path)
+    cfg = load_config()
+    matches: list[tuple[int, bool, bool, int]] = []
     for year in configured_years():
         site = get_site(year)
         site_parsed = urlparse(site.url)
         site_prefix = posixpath.normpath(site_parsed.path or "/").rstrip("/") + "/"
         if req_origin == _origin(site.url) and norm_path.startswith(site_prefix):
-            return year
+            matches.append((len(site_prefix), year == preferred_year, year == cfg.default_year, year))
+    if matches:
+        matches.sort(reverse=True)
+        return matches[0][3]
     raise ValueError(
         "Only links to your configured Moodle site can be accessed "
-        "(e.g. file URLs from `runi course <course> contents`)."
+        "(e.g. file URLs from `mdl course <course> contents`)."
     )
 
 
@@ -233,7 +239,7 @@ def _file_text(url: str, year: int) -> tuple[str, str]:
         content = _read_bounded(
             response,
             MAX_READ_BYTES,
-            "File is larger than 25 MB; download it with `runi download` instead.",
+            "File is larger than 25 MB; download it with `mdl download` instead.",
         )
 
     if kind == "application/json":
@@ -256,14 +262,14 @@ def _file_text(url: str, year: int) -> tuple[str, str]:
         return name, html_to_text(text) if kind == "text/html" else text
     raise ValueError(
         f"Can't extract text from {kind or 'this type of'} files; supported: PDF, PowerPoint (.pptx), "
-        "Word (.docx), notebooks (.ipynb), text, code and HTML. Use `runi download` to save the file."
+        "Word (.docx), notebooks (.ipynb), text, code and HTML. Use `mdl download` to save the file."
     )
 
 
-def read_content(url: str, offset: int = 0) -> dict:
+def read_content(url: str, offset: int = 0, year: int | None = None) -> dict:
     if offset < 0:
         raise ValueError("offset must be 0 or greater.")
-    year = _site_year(url)
+    resolved_year = _site_year(url, preferred_year=year)
     parsed = urlparse(url)
     path = parsed.path
     if "/mod/page/view.php" in path:
@@ -271,9 +277,9 @@ def read_content(url: str, offset: int = 0) -> dict:
         if not id_values or not id_values[0].isdigit():
             raise ValueError("Page URL must include a numeric ?id=<cmid> query parameter.")
         cmid = int(id_values[0])
-        name, text = _page_text(cmid, year)
+        name, text = _page_text(cmid, resolved_year)
     elif "/pluginfile.php/" in path or "/webservice/pluginfile.php/" in path:
-        name, text = _file_text(url, year)
+        name, text = _file_text(url, resolved_year)
     else:
         raise ValueError(
             "Pass a file URL (.../pluginfile.php/...) or a Page URL (.../mod/page/view.php?id=...)."
@@ -338,9 +344,10 @@ def download_file(
     overwrite: bool = False,
     *,
     dest_is_dir: bool = False,
+    year: int | None = None,
 ) -> dict:
     """Download a Moodle pluginfile.php URL directly to disk."""
-    year = _site_year(url)
+    resolved_year = _site_year(url, preferred_year=year)
     parsed = urlparse(url)
     if "/pluginfile.php/" not in parsed.path and "/webservice/pluginfile.php/" not in parsed.path:
         raise ValueError("Pass a Moodle file URL (.../pluginfile.php/...).")
@@ -364,13 +371,13 @@ def download_file(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     limit_msg = f"File exceeds {MAX_DOWNLOAD_BYTES // (1024 * 1024)} MB download limit."
 
-    with _open_file_stream(url, year) as response:
+    with _open_file_stream(url, resolved_year) as response:
         kind = response.headers.get("content-type", "").split(";")[0].strip().lower()
         cl = response.headers.get("content-length", "").strip()
         if cl.isdigit() and int(cl) > MAX_DOWNLOAD_BYTES:
             raise ValueError(limit_msg)
 
-        fd, tmp_name = tempfile.mkstemp(prefix=".runi-dl-", suffix=".part", dir=str(out_path.parent))
+        fd, tmp_name = tempfile.mkstemp(prefix=".mdl-dl-", suffix=".part", dir=str(out_path.parent))
         tmp_path = Path(tmp_name)
         total = 0
         try:
@@ -453,7 +460,7 @@ def download_course_files(
             for f in item.get("files", []):
                 target = _unique_target(sec_dir, f["filename"], used_paths)
                 try:
-                    res = download_file(f["url"], dest=target, overwrite=overwrite)
+                    res = download_file(f["url"], dest=target, overwrite=overwrite, year=year)
                 except httpx.HTTPError as exc:
                     errors.append(
                         {"filename": f["filename"], "url": sanitize_url(f["url"]), "error": sanitize_http_error(exc)}

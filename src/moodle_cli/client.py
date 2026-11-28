@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from runi_moodle_cli.config import AuthError, Site, get_site
+from moodle_cli.config import AuthError, Site, get_site
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 

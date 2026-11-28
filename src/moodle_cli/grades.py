@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from runi_moodle_cli.client import call, get_user_id
-from runi_moodle_cli.courses import list_courses
-from runi_moodle_cli.formatting import html_to_text, unescape_text
+from moodle_cli.client import call, get_user_id
+from moodle_cli.courses import list_courses
+from moodle_cli.formatting import html_to_text, unescape_text
 
 
 def _clean(value: str | None) -> str | None:

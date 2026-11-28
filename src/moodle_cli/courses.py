@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import re
 
-from runi_moodle_cli.client import call
-from runi_moodle_cli.config import get_site
-from runi_moodle_cli.formatting import file_list, html_to_text, unescape_text
+from moodle_cli.client import call
+from moodle_cli.config import get_site
+from moodle_cli.formatting import file_list, html_to_text, unescape_text
 
 # RUNI short names look like "Computer Networks-592-2026/1 - 2601137":
 # <name>-<course number>-<year>/<semester> - <moodle id>
@@ -15,6 +15,7 @@ SHORTNAME = re.compile(r"-(\d+)-\d{4}/(\d+)\s*-\s*\d+$")
 STAFF_ROLES = {
     "editingteacher": "lecturer",
     "teacher": "lecturer",
+    "noneditingteacher": "TA",
     "tutor": "TA",
     "instruction_assistant": "TA",
 }
@@ -78,7 +79,7 @@ def resolve_course(query: str, year: int | None = None) -> dict:
         )
         raise ValueError(f"Multiple courses match {query!r}:\n{choices}\nPass a more specific name or the course id.")
 
-    raise ValueError(f"No course matching {query!r}. Run `runi courses` to see your enrolled courses.")
+    raise ValueError(f"No course matching {query!r}. Run `mdl courses` to see your enrolled courses.")
 
 
 def get_course_staff(course_id: int, year: int | None = None) -> list[dict]:
