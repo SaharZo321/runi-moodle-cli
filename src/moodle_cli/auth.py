@@ -6,6 +6,7 @@ import base64
 from html.parser import HTMLParser
 import re
 import secrets
+import sys
 from typing import Any
 from urllib.parse import unquote, urlencode, urljoin, urlparse
 
@@ -492,6 +493,35 @@ def login_with_credentials(
     )
 
 
+_BROWSER_CHANNELS: tuple[str | None, ...] = ("chrome", "msedge", None)
+
+
+def _launch_browser(playwright: Any) -> Any:
+    """Launch installed Chrome or Edge first, falling back to Playwright's bundled Chromium."""
+    last_exc: Exception | None = None
+    for channel in _BROWSER_CHANNELS:
+        try:
+            if channel is None:
+                return playwright.chromium.launch(headless=False)
+            return playwright.chromium.launch(headless=False, channel=channel)
+        except Exception as exc:
+            last_exc = exc
+    last_detail = str(last_exc).strip().splitlines()[0].strip() if last_exc and str(last_exc).strip() else ""
+    detail_line = f"\nLast error: {last_detail}" if last_detail else ""
+    install_cmd = (
+        f'& "{sys.executable}" -m playwright install chromium'
+        if sys.platform == "win32"
+        else f'"{sys.executable}" -m playwright install chromium'
+    )
+    raise AuthError(
+        "Could not launch Google Chrome, Microsoft Edge, or Playwright Chromium."
+        f"{detail_line}\n"
+        "Install Chrome or Edge (no extra download needed), or download Playwright's Chromium with:\n"
+        f"  {install_cmd}\n"
+        "Or use `mdl auth login` (interactive credentials) or `--cookie` / `--token` instead."
+    ) from last_exc
+
+
 def login_with_browser(
     year: int,
     base_url: str = DEFAULT_BASE_URL,
@@ -506,10 +536,17 @@ def login_with_browser(
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
+        if getattr(sys, "frozen", False):
+            raise AuthError(
+                "Browser SSO login (--browser) is not bundled in the standalone binary.\n"
+                "Use `mdl auth login` (interactive credentials), `--cookie`, or `--token` instead,\n"
+                "or install the Python package with browser support and run that `mdl`:\n"
+                '  uv tool install "moodle-cli[browser] @ git+https://github.com/SaharZo321/moodle-cli.git"'
+            ) from exc
         raise AuthError(
             "Browser login requires Playwright. Install it with:\n"
-            '  uv tool install ".[browser]"   (or: uv tool install "git+https://github.com/SaharZo321/moodle-cli.git[browser]")\n'
-            "  uvx playwright install chromium\n"
+            '  uv tool install "moodle-cli[browser] @ git+https://github.com/SaharZo321/moodle-cli.git"\n'
+            "Uses your existing Chrome or Edge automatically (no browser download needed).\n"
             "Or use `mdl auth login` (interactive credentials) or `--cookie` / `--token` instead."
         ) from exc
 
@@ -517,7 +554,7 @@ def login_with_browser(
     captured_location: dict[str, str] = {}
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = _launch_browser(p)
         try:
             context = browser.new_context()
             page = context.new_page()

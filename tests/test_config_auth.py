@@ -548,3 +548,70 @@ def test_login_with_credentials_pins_runi_origin_port_and_redacts_userinfo(moodl
     with pytest.raises(AuthError, match="untrusted URL"):
         login_with_credentials("sahar", "secret", year=2027)
     assert moodle_post.call_count == 0
+
+
+def test_launch_browser_tries_chrome_then_msedge_then_bundled_chromium(monkeypatch):
+    import builtins
+    import sys
+
+    from moodle_cli import auth
+
+    class FakeChromium:
+        def __init__(self, succeed_on):
+            self.succeed_on = succeed_on
+            self.calls = []
+
+        def launch(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            channel = kwargs.get("channel")
+            if channel == self.succeed_on:
+                return f"browser:{channel}"
+            raise RuntimeError(f"not installed: {channel}\nsecond line")
+
+    class FakePlaywright:
+        def __init__(self, succeed_on):
+            self.chromium = FakeChromium(succeed_on)
+
+    # Prefers installed Chrome
+    pw_chrome = FakePlaywright("chrome")
+    assert auth._launch_browser(pw_chrome) == "browser:chrome"
+    assert pw_chrome.chromium.calls == [{"headless": False, "channel": "chrome"}]
+
+    # Falls back to Edge when Chrome is unavailable
+    pw_edge = FakePlaywright("msedge")
+    assert auth._launch_browser(pw_edge) == "browser:msedge"
+    assert pw_edge.chromium.calls == [
+        {"headless": False, "channel": "chrome"},
+        {"headless": False, "channel": "msedge"},
+    ]
+
+    # Falls back to bundled Playwright Chromium (omitting channel kwarg) when neither Chrome nor Edge is available
+    pw_bundled = FakePlaywright(None)
+    assert auth._launch_browser(pw_bundled) == "browser:None"
+    assert pw_bundled.chromium.calls == [
+        {"headless": False, "channel": "chrome"},
+        {"headless": False, "channel": "msedge"},
+        {"headless": False},
+    ]
+
+    # Raises actionable AuthError with matching interpreter command and first line of last error
+    pw_none = FakePlaywright("nonexistent")
+    with pytest.raises(AuthError) as exc_info:
+        auth._launch_browser(pw_none)
+    msg = str(exc_info.value)
+    assert f'"{sys.executable}" -m playwright install chromium' in msg
+    assert "Last error: not installed: None" in msg
+    assert "second line" not in msg
+
+    # Frozen standalone binary gives clear guidance when Playwright is not bundled
+    real_import = builtins.__import__
+
+    def block_playwright(name, *args, **kwargs):
+        if name.startswith("playwright"):
+            raise ImportError("No module named 'playwright'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", block_playwright)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    with pytest.raises(AuthError, match="not bundled in the standalone binary"):
+        auth.login_with_browser(2027)

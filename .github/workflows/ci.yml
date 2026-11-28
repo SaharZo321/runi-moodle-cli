@@ -66,15 +66,53 @@ jobs:
             /tmp/smoke-venv/bin/"$cmd" --version
           done
 
+  build-binary:
+    name: Build & smoke test binary (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - name: Build standalone binary
+        shell: bash
+        run: |
+          uv sync --locked --no-dev
+          uv pip install "pyinstaller>=6.10,<7"
+          uv run --no-sync pyinstaller \
+            --onefile \
+            --paths src \
+            --name mdl-linux-x64 \
+            --copy-metadata moodle-cli \
+            --collect-submodules rich._unicode_data \
+            --collect-data docx \
+            --collect-data pptx \
+            --collect-data certifi \
+            packaging/pyinstaller_entry.py
+      - name: Smoke test standalone binary
+        shell: bash
+        env:
+          NO_COLOR: "1"
+        run: |
+          EXPECTED="moodle-cli $(uv run --no-sync python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          OUT=$(./dist/mdl-linux-x64 --version | tr -d '\r')
+          echo "Binary reported: $OUT"
+          if [ "$OUT" != "$EXPECTED" ]; then
+            echo "Expected '$EXPECTED', got '$OUT'"
+            exit 1
+          fi
+          ./dist/mdl-linux-x64 --help > /dev/null
+
   ci:
     name: CI
     runs-on: ubuntu-latest
-    needs: [test, build]
+    needs: [test, build, build-binary]
     if: always()
     steps:
       - name: Check job results
         run: |
-          if [ "${{ needs.test.result }}" != "success" ] || [ "${{ needs.build.result }}" != "success" ]; then
-            echo "CI failed: test=${{ needs.test.result }}, build=${{ needs.build.result }}"
+          if [ "${{ needs.test.result }}" != "success" ] || [ "${{ needs.build.result }}" != "success" ] || [ "${{ needs.build-binary.result }}" != "success" ]; then
+            echo "CI failed: test=${{ needs.test.result }}, build=${{ needs.build.result }}, build-binary=${{ needs.build-binary.result }}"
             exit 1
           fi
