@@ -33,9 +33,9 @@ browser = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/SaharZo321/runi-moodle-cli"
-Repository = "https://github.com/SaharZo321/runi-moodle-cli"
-Issues = "https://github.com/SaharZo321/runi-moodle-cli/issues"
+Homepage = "https://github.com/SaharZo321/moodle-cli"
+Repository = "https://github.com/SaharZo321/moodle-cli"
+Issues = "https://github.com/SaharZo321/moodle-cli/issues"
 
 [project.scripts]
 mdl = "moodle_cli.cli:main"

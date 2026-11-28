@@ -12,12 +12,12 @@ Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/) (or `pipx` / `pip`):
 
 ```bash
 # Clone and install globally (Windows, macOS, Linux)
-git clone https://github.com/SaharZo321/runi-moodle-cli.git
-cd runi-moodle-cli
+git clone https://github.com/SaharZo321/moodle-cli.git
+cd moodle-cli
 uv tool install .
 
 # Or install directly from GitHub
-uv tool install git+https://github.com/SaharZo321/runi-moodle-cli.git
+uv tool install git+https://github.com/SaharZo321/moodle-cli.git
 
 # With optional Playwright browser SSO login (--browser)
 uv tool install ".[browser]"

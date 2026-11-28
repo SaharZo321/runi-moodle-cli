@@ -508,7 +508,7 @@ def login_with_browser(
     except ImportError as exc:
         raise AuthError(
             "Browser login requires Playwright. Install it with:\n"
-            '  uv tool install ".[browser]"   (or: uv tool install "git+https://github.com/SaharZo321/runi-moodle-cli.git[browser]")\n'
+            '  uv tool install ".[browser]"   (or: uv tool install "git+https://github.com/SaharZo321/moodle-cli.git[browser]")\n'
             "  uvx playwright install chromium\n"
             "Or use `mdl auth login` (interactive credentials) or `--cookie` / `--token` instead."
         ) from exc
