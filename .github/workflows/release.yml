@@ -97,9 +97,11 @@ jobs:
             --name "${{ matrix.binary_name }}" \
             --copy-metadata moodle-cli \
             --collect-submodules rich._unicode_data \
+            --collect-submodules zendriver \
             --collect-data docx \
             --collect-data pptx \
             --collect-data certifi \
+            --collect-data emoji \
             packaging/pyinstaller_entry.py
 
       - name: Smoke test standalone binary

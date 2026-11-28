@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from html.parser import HTMLParser
+import os
 import re
 import secrets
-import sys
+import time
 from typing import Any
 from urllib.parse import unquote, urlencode, urljoin, urlparse
 
@@ -493,33 +495,19 @@ def login_with_credentials(
     )
 
 
-_BROWSER_CHANNELS: tuple[str | None, ...] = ("chrome", "msedge", None)
+def _is_moodle_launch_url(url: str, moodle_origin: tuple[str, str, int]) -> bool:
+    return bool(url) and _origin(url) == moodle_origin and urlparse(url).path.endswith("/admin/tool/mobile/launch.php")
 
 
-def _launch_browser(playwright: Any) -> Any:
-    """Launch installed Chrome or Edge first, falling back to Playwright's bundled Chromium."""
-    last_exc: Exception | None = None
-    for channel in _BROWSER_CHANNELS:
-        try:
-            if channel is None:
-                return playwright.chromium.launch(headless=False)
-            return playwright.chromium.launch(headless=False, channel=channel)
-        except Exception as exc:
-            last_exc = exc
-    last_detail = str(last_exc).strip().splitlines()[0].strip() if last_exc and str(last_exc).strip() else ""
-    detail_line = f"\nLast error: {last_detail}" if last_detail else ""
-    install_cmd = (
-        f'& "{sys.executable}" -m playwright install chromium'
-        if sys.platform == "win32"
-        else f'"{sys.executable}" -m playwright install chromium'
-    )
-    raise AuthError(
-        "Could not launch Google Chrome, Microsoft Edge, or Playwright Chromium."
-        f"{detail_line}\n"
-        "Install Chrome or Edge (no extra download needed), or download Playwright's Chromium with:\n"
-        f"  {install_cmd}\n"
-        "Or use `mdl auth login` (interactive credentials) or `--cookie` / `--token` instead."
-    ) from last_exc
+def _extract_mobile_location(headers: Any) -> str | None:
+    if not isinstance(headers, dict):
+        return None
+    for key, value in headers.items():
+        if str(key).lower() == "location":
+            loc = str(value).strip()
+            if loc.lower().startswith("moodlemobile://"):
+                return loc
+    return None
 
 
 def login_with_browser(
@@ -529,68 +517,110 @@ def login_with_browser(
     *,
     site_url: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """Open a real browser window via Playwright so the user can complete SSO,
-    then capture the long-lived Moodle mobile wstoken automatically."""
+    """Open an isolated window in the user's installed Chrome, Brave, or Edge via zendriver (CDP),
+    so the user can complete SSO/MFA and capture the long-lived Moodle mobile wstoken automatically."""
     resolved = resolve_site_url(year, base_url=base_url, site_url=site_url)
     moodle_origin = _origin(resolved)
     try:
-        from playwright.sync_api import sync_playwright
+        import zendriver as zd
+        from zendriver import cdp
     except ImportError as exc:
-        if getattr(sys, "frozen", False):
-            raise AuthError(
-                "Browser SSO login (--browser) is not bundled in the standalone binary.\n"
-                "Use `mdl auth login` (interactive credentials), `--cookie`, or `--token` instead,\n"
-                "or install the Python package with browser support and run that `mdl`:\n"
-                '  uv tool install "moodle-cli[browser] @ git+https://github.com/SaharZo321/moodle-cli.git"'
-            ) from exc
         raise AuthError(
-            "Browser login requires Playwright. Install it with:\n"
-            '  uv tool install "moodle-cli[browser] @ git+https://github.com/SaharZo321/moodle-cli.git"\n'
-            "Uses your existing Chrome or Edge automatically (no browser download needed).\n"
-            "Or use `mdl auth login` (interactive credentials) or `--cookie` / `--token` instead."
+            "Browser login requires zendriver. Reinstall moodle-cli, or use `mdl auth login` "
+            "(interactive credentials) or `--cookie` / `--token` instead."
         ) from exc
 
     target_url = launch_url(year=year, base_url=base_url, site_url=site_url)
-    captured_location: dict[str, str] = {}
+    browser_path = os.environ.get("MOODLE_BROWSER_PATH") or None
 
-    with sync_playwright() as p:
-        browser = _launch_browser(p)
+    async def _capture_redirect() -> str | None:
+        captured: dict[str, str] = {}
+        captured_event = asyncio.Event()
+        launch_request_ids: set[str] = set()
+
+        def _record(location: str | None) -> None:
+            if location and "value" not in captured:
+                captured["value"] = location
+                captured_event.set()
+
         try:
-            context = browser.new_context()
-            page = context.new_page()
+            browser = await zd.start(
+                headless=False,
+                browser="auto",
+                browser_executable_path=browser_path,
+            )
+        except Exception as exc:
+            detail = str(exc).strip().splitlines()[0].strip() if str(exc).strip() else ""
+            detail_line = f"\nDetails: {detail}" if detail else ""
+            raise AuthError(
+                "Could not launch Chrome, Brave, or Microsoft Edge for browser login."
+                f"{detail_line}\n"
+                "Install Chrome, Brave, or Edge (or set MOODLE_BROWSER_PATH to a Chromium-based browser),\n"
+                "or use `mdl auth login` (interactive credentials) or `--cookie` / `--token` instead."
+            ) from exc
 
-            def on_response(response: Any) -> None:
-                if _origin(response.url) == moodle_origin and urlparse(response.url).path.endswith(
-                    "/admin/tool/mobile/launch.php"
-                ):
-                    loc = response.headers.get("location", "")
-                    if loc.lower().startswith("moodlemobile://"):
-                        captured_location["value"] = loc
+        try:
+            tab = browser.main_tab
 
-            page.on("response", on_response)
+            def on_request(event: Any) -> None:
+                req = getattr(event, "request", None)
+                req_url = str(getattr(req, "url", "") or "")
+                req_id = getattr(event, "request_id", None)
+                if _is_moodle_launch_url(req_url, moodle_origin) and req_id is not None:
+                    launch_request_ids.add(str(req_id))
+                redir = getattr(event, "redirect_response", None)
+                redir_url = str(getattr(redir, "url", "") or "")
+                if _is_moodle_launch_url(redir_url, moodle_origin):
+                    _record(_extract_mobile_location(getattr(redir, "headers", None)))
+                    if req_url.lower().startswith("moodlemobile://"):
+                        _record(req_url)
+
+            def on_response_extra(event: Any) -> None:
+                req_id = getattr(event, "request_id", None)
+                if req_id is not None and str(req_id) in launch_request_ids:
+                    _record(_extract_mobile_location(getattr(event, "headers", None)))
+
+            def on_response(event: Any) -> None:
+                resp = getattr(event, "response", None)
+                resp_url = str(getattr(resp, "url", "") or "")
+                if _is_moodle_launch_url(resp_url, moodle_origin):
+                    _record(_extract_mobile_location(getattr(resp, "headers", None)))
+
+            tab.add_handler(cdp.network.RequestWillBeSent, on_request)
+            tab.add_handler(cdp.network.ResponseReceivedExtraInfo, on_response_extra)
+            tab.add_handler(cdp.network.ResponseReceived, on_response)
+            await tab.send(cdp.network.enable())
+
             try:
-                page.goto(target_url, wait_until="domcontentloaded", timeout=30_000)
+                await tab.get(target_url)
             except Exception:
                 # Some browsers abort navigation when hitting a custom moodlemobile:// scheme
                 pass
 
-            elapsed_ms = 0
-            step_ms = 500
-            limit_ms = timeout_seconds * 1000
-            while "value" not in captured_location and elapsed_ms < limit_ms:
-                if page.is_closed():
+            deadline = time.monotonic() + timeout_seconds
+            while not captured_event.is_set() and time.monotonic() < deadline:
+                if getattr(browser, "stopped", False) or getattr(tab, "closed", False):
                     break
-                page.wait_for_timeout(step_ms)
-                elapsed_ms += step_ms
+                remaining = max(0.05, min(0.5, deadline - time.monotonic()))
+                try:
+                    await asyncio.wait_for(captured_event.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    pass
         finally:
-            browser.close()
+            try:
+                await browser.stop()
+            except Exception:
+                pass
 
-    if "value" not in captured_location:
+        return captured.get("value")
+
+    captured_location = asyncio.run(_capture_redirect())
+    if not captured_location:
         raise AuthError(
             "Timed out or browser was closed before Moodle returned a mobile token. "
             "Please try `mdl auth login --browser` again."
         )
 
-    token = parse_mobile_redirect(captured_location["value"])
+    token = parse_mobile_redirect(captured_location)
     info = verify_token(year=year, token=token, base_url=base_url, site_url=site_url)
     return token, info

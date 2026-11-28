@@ -550,68 +550,103 @@ def test_login_with_credentials_pins_runi_origin_port_and_redacts_userinfo(moodl
     assert moodle_post.call_count == 0
 
 
-def test_launch_browser_tries_chrome_then_msedge_then_bundled_chromium(monkeypatch):
-    import builtins
-    import sys
+def test_login_with_browser_zendriver_cdp_capture_origin_pinning_and_errors(monkeypatch):
+    import base64
+    from types import SimpleNamespace
+
+    import zendriver as zd
+    from zendriver import cdp
 
     from moodle_cli import auth
 
-    class FakeChromium:
-        def __init__(self, succeed_on):
-            self.succeed_on = succeed_on
-            self.calls = []
+    tok_b64 = base64.b64encode(b"sig:::real_mobile_tok").decode()
+    fake_tok_b64 = base64.b64encode(b"sig:::evil_tok").decode()
 
-        def launch(self, **kwargs):
-            self.calls.append(dict(kwargs))
-            channel = kwargs.get("channel")
-            if channel == self.succeed_on:
-                return f"browser:{channel}"
-            raise RuntimeError(f"not installed: {channel}\nsecond line")
+    class FakeTab:
+        def __init__(self, scenario):
+            self.scenario = scenario
+            self.handlers = {}
+            self.closed = False
+            self.network_enabled = False
 
-    class FakePlaywright:
-        def __init__(self, succeed_on):
-            self.chromium = FakeChromium(succeed_on)
+        def add_handler(self, event_type, fn):
+            self.handlers[event_type] = fn
 
-    # Prefers installed Chrome
-    pw_chrome = FakePlaywright("chrome")
-    assert auth._launch_browser(pw_chrome) == "browser:chrome"
-    assert pw_chrome.chromium.calls == [{"headless": False, "channel": "chrome"}]
+        async def send(self, cmd):
+            self.network_enabled = True
 
-    # Falls back to Edge when Chrome is unavailable
-    pw_edge = FakePlaywright("msedge")
-    assert auth._launch_browser(pw_edge) == "browser:msedge"
-    assert pw_edge.chromium.calls == [
-        {"headless": False, "channel": "chrome"},
-        {"headless": False, "channel": "msedge"},
-    ]
+        async def get(self, url):
+            on_req = self.handlers[cdp.network.RequestWillBeSent]
+            on_extra = self.handlers[cdp.network.ResponseReceivedExtraInfo]
+            on_resp = self.handlers[cdp.network.ResponseReceived]
 
-    # Falls back to bundled Playwright Chromium (omitting channel kwarg) when neither Chrome nor Edge is available
-    pw_bundled = FakePlaywright(None)
-    assert auth._launch_browser(pw_bundled) == "browser:None"
-    assert pw_bundled.chromium.calls == [
-        {"headless": False, "channel": "chrome"},
-        {"headless": False, "channel": "msedge"},
-        {"headless": False},
-    ]
+            if self.scenario == "extra_info":
+                # Foreign origin redirect must be ignored
+                on_resp(
+                    SimpleNamespace(
+                        response=SimpleNamespace(
+                            url="https://evil.example/admin/tool/mobile/launch.php",
+                            headers={"Location": f"moodlemobile://token={fake_tok_b64}"},
+                        )
+                    )
+                )
+                # Real Moodle launch.php request + ResponseReceivedExtraInfo header
+                on_req(
+                    SimpleNamespace(
+                        request_id="req-1",
+                        request=SimpleNamespace(url="https://moodle.runi.ac.il/2027/admin/tool/mobile/launch.php?service=moodle_mobile_app"),
+                        redirect_response=None,
+                    )
+                )
+                on_extra(
+                    SimpleNamespace(
+                        request_id="req-1",
+                        headers={"Location": f"moodlemobile://token={tok_b64}"},
+                    )
+                )
+            elif self.scenario == "closed":
+                self.closed = True
 
-    # Raises actionable AuthError with matching interpreter command and first line of last error
-    pw_none = FakePlaywright("nonexistent")
+    class FakeBrowser:
+        def __init__(self, scenario):
+            self.main_tab = FakeTab(scenario)
+            self.stopped = False
+
+        async def stop(self):
+            self.stopped = True
+
+    start_calls = []
+
+    async def fake_start(**kwargs):
+        start_calls.append(kwargs)
+        if kwargs.get("browser_executable_path") == "/bad/browser":
+            raise FileNotFoundError("could not find browser\nsecond line")
+        return FakeBrowser(scenario_holder["value"])
+
+    scenario_holder = {"value": "extra_info"}
+    monkeypatch.setattr(zd, "start", fake_start)
+    monkeypatch.setattr(auth, "verify_token", lambda **kw: {"userid": 1, "fullname": "Test User", "tok": kw["token"]})
+
+    # 1. Happy path: ignores foreign origin, captures ResponseReceivedExtraInfo, stops browser
+    monkeypatch.setenv("MOODLE_BROWSER_PATH", "/usr/bin/brave")
+    token, info = auth.login_with_browser(2027, timeout_seconds=5)
+    assert token == "real_mobile_tok"
+    assert info["fullname"] == "Test User"
+    assert start_calls[-1]["browser"] == "auto"
+    assert start_calls[-1]["headless"] is False
+    assert start_calls[-1]["browser_executable_path"] == "/usr/bin/brave"
+
+    # 2. Browser closed before redirect raises AuthError cleanly
+    scenario_holder["value"] = "closed"
+    monkeypatch.delenv("MOODLE_BROWSER_PATH", raising=False)
+    with pytest.raises(AuthError, match="Timed out or browser was closed"):
+        auth.login_with_browser(2027, timeout_seconds=5)
+
+    # 3. Missing browser raises actionable AuthError with first error line only
+    monkeypatch.setenv("MOODLE_BROWSER_PATH", "/bad/browser")
     with pytest.raises(AuthError) as exc_info:
-        auth._launch_browser(pw_none)
+        auth.login_with_browser(2027, timeout_seconds=5)
     msg = str(exc_info.value)
-    assert f'"{sys.executable}" -m playwright install chromium' in msg
-    assert "Last error: not installed: None" in msg
+    assert "Details: could not find browser" in msg
     assert "second line" not in msg
-
-    # Frozen standalone binary gives clear guidance when Playwright is not bundled
-    real_import = builtins.__import__
-
-    def block_playwright(name, *args, **kwargs):
-        if name.startswith("playwright"):
-            raise ImportError("No module named 'playwright'")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", block_playwright)
-    monkeypatch.setattr(sys, "frozen", True, raising=False)
-    with pytest.raises(AuthError, match="not bundled in the standalone binary"):
-        auth.login_with_browser(2027)
+    assert "MOODLE_BROWSER_PATH" in msg

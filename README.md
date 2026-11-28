@@ -12,7 +12,7 @@ Built on the Moodle API modules from [shanikn/Moodle_MCP](https://github.com/sha
 Download the prebuilt binary for your OS from the [latest GitHub Release](https://github.com/SaharZo321/moodle-cli/releases/latest) (`mdl-windows-x64.exe`, `mdl-macos-arm64`, or `mdl-linux-x64`) and verify against `SHA256SUMS.txt`:
 
 ```bash
-# Linux / macOS: mark executable and run
+# Linux / macOS: mark executable and run (substitute mdl-macos-arm64 on macOS)
 chmod +x ./mdl-linux-x64
 ./mdl-linux-x64 --version
 
@@ -20,17 +20,12 @@ chmod +x ./mdl-linux-x64
 xattr -d com.apple.quarantine ./mdl-macos-arm64
 ```
 
-> **Note:** Standalone binaries support interactive credentials (`mdl auth login`), `--cookie`, and `--token`, but do not bundle Playwright (`--browser`). For `--browser` SSO login, install the Python package with `[browser]` below.
-
 ### With Python / `uv`
 Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/) (or `pipx` / `pip`):
 
 ```bash
-# Install directly from GitHub
+# Install directly from GitHub (includes browser SSO via your existing Chrome, Brave, or Edge)
 uv tool install git+https://github.com/SaharZo321/moodle-cli.git
-
-# With optional Playwright browser SSO login (--browser; uses your existing Chrome or Edge automatically)
-uv tool install "moodle-cli[browser] @ git+https://github.com/SaharZo321/moodle-cli.git"
 
 # Or clone and install locally
 git clone https://github.com/SaharZo321/moodle-cli.git
@@ -64,7 +59,7 @@ The CLI exchanges that short-lived cookie for a **long-lived Mobile App token** 
 ```bash
 mdl auth login --year 2027 --browser
 ```
-Opens an isolated temporary window using your installed Chrome or Edge (no extra browser download needed; falls back to Playwright Chromium if neither is installed), supports MFA, and captures the long-lived token automatically.
+Opens an isolated temporary window using your installed Chrome, Brave, or Edge (no extra browser download needed; override with `MOODLE_BROWSER_PATH`), supports MFA, and captures the long-lived token automatically. Works in both `uv` installs and standalone binaries.
 
 #### Option 4: Direct mobile token
 ```bash
