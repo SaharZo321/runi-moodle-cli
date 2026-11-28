@@ -507,3 +507,426 @@ def test_new_assignments_isolates_state_per_site_url(monkeypatch, moodle_api, tm
     save_token(2027, "tok_alpha_2", site_url="https://moodle.alpha.edu")
     first_alpha_2 = assignments.new_assignments(year=2027)
     assert first_alpha_2["first_run"] is True
+
+
+def test_client_flatten_nested_and_upload_draft_file(configured_site, moodle_api, tmp_path):
+    flat = client._flatten(
+        {
+            "courseids": [5, 7],
+            "plugindata": {
+                "files_filemanager": 999,
+                "onlinetext_editor": {"text": "<p>hi</p>", "format": 1, "itemid": 0},
+            },
+        }
+    )
+    assert flat == {
+        "courseids[0]": 5,
+        "courseids[1]": 7,
+        "plugindata[files_filemanager]": 999,
+        "plugindata[onlinetext_editor][text]": "<p>hi</p>",
+        "plugindata[onlinetext_editor][format]": 1,
+        "plugindata[onlinetext_editor][itemid]": 0,
+    }
+
+    from moodle_cli.config import get_site
+
+    sample = tmp_path / "hw1.pdf"
+    sample.write_bytes(b"%PDF-1.4\nhello")
+    site = get_site()
+
+    # Happy path
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/upload.php").mock(
+        return_value=httpx.Response(200, json=[{"filename": "hw1.pdf", "itemid": 424242, "filepath": "/"}])
+    )
+    uploaded = client.upload_draft_file(site, sample, itemid=0)
+    assert uploaded["itemid"] == 424242
+
+    # Redirect rejected without leaking token
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/upload.php").mock(
+        return_value=httpx.Response(302, headers={"location": "https://evil.example/steal"})
+    )
+    with pytest.raises(client.MoodleError, match="redirected"):
+        client.upload_draft_file(site, sample)
+
+    # invalidtoken raises AuthError
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/upload.php").mock(
+        return_value=httpx.Response(200, json={"errorcode": "invalidtoken", "error": "Invalid token"})
+    )
+    with pytest.raises(AuthError):
+        client.upload_draft_file(site, sample)
+
+    # Per-file list error is surfaced and bare token echoes are redacted
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/upload.php").mock(
+        return_value=httpx.Response(
+            200, json=[{"errortype": "fileexists", "error": f"Bad upload for {site.token}"}]
+        )
+    )
+    with pytest.raises(client.MoodleError) as exc_info:
+        client.upload_draft_file(site, sample)
+    assert "fileexists" in str(exc_info.value)
+    assert site.token not in str(exc_info.value)
+
+    # Invalid/zero or mismatched draft itemid raises MoodleError
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/upload.php").mock(
+        return_value=httpx.Response(200, json=[{"filename": "hw1.pdf", "itemid": 0}])
+    )
+    with pytest.raises(client.MoodleError, match="invalid draft itemid"):
+        client.upload_draft_file(site, sample)
+
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/upload.php").mock(
+        return_value=httpx.Response(200, json=[{"filename": "hw1.pdf", "itemid": 999}])
+    )
+    with pytest.raises(client.MoodleError, match="expected 424242"):
+        client.upload_draft_file(site, sample, itemid=424242)
+
+    # Explicit filename overrides path.name (symlink name preservation)
+    captured_filename: list[bytes] = []
+
+    def capture_upload(request: httpx.Request):
+        captured_filename.append(request.content)
+        return httpx.Response(200, json=[{"filename": "alias.pdf", "itemid": 424242}])
+
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/upload.php").mock(side_effect=capture_upload)
+    client.upload_draft_file(site, sample, filename="alias.pdf")
+    assert b'filename="alias.pdf"' in captured_filename[0]
+
+
+def test_submit_assignment_files_text_draft_finalize_and_validation(configured_site, moodle_api, tmp_path):
+    now_ts = int(time.time())
+    future_ts = now_ts + 86400 * 5
+    f1 = tmp_path / "report.pdf"
+    f2 = tmp_path / "code.py"
+    f1.write_bytes(b"%PDF-1.4 data")
+    f2.write_text("print('ok')\n", encoding="utf-8")
+
+    state = {
+        "submissiondrafts": 1,
+        "requiresubmissionstatement": 1,
+        "status": "new",
+        "canedit": True,
+        "cansubmit": True,
+        "locked": False,
+        "submissionsenabled": True,
+        "maxfiles": "2",
+        "maxbytes": "100",
+        "upload_itemids": [],
+        "saved_bodies": [],
+        "submitted_for_grading": [],
+        "save_response": [],
+        "draft_files": [],
+        "saved_files": [],
+        "saved_text": "",
+        "teamsubmission": 0,
+    }
+
+    def rest_handler(request: httpx.Request):
+        body = request.content.decode()
+        if "mod_assign_get_assignments" in body:
+            return httpx.Response(
+                200,
+                json={
+                    "courses": [
+                        {
+                            "id": 101,
+                            "fullname": "Algorithms",
+                            "assignments": [
+                                {
+                                    "id": 50,
+                                    "cmid": 500,
+                                    "name": "HW 1",
+                                    "duedate": future_ts,
+                                    "cutoffdate": 0,
+                                    "teamsubmission": state["teamsubmission"],
+                                    "submissiondrafts": state["submissiondrafts"],
+                                    "requiresubmissionstatement": state["requiresubmissionstatement"],
+                                    "configs": [
+                                        {"plugin": "file", "subtype": "assignsubmission", "name": "enabled", "value": "1"},
+                                        {"plugin": "file", "subtype": "assignsubmission", "name": "maxfilesubmissions", "value": state["maxfiles"]},
+                                        {"plugin": "file", "subtype": "assignsubmission", "name": "maxsubmissionsizebytes", "value": state["maxbytes"]},
+                                        {"plugin": "onlinetext", "subtype": "assignsubmission", "name": "enabled", "value": "1"},
+                                    ],
+                                }
+                            ],
+                        }
+                    ]
+                },
+            )
+        if "mod_assign_get_submission_status" in body:
+            plugins_list = []
+            if state["status"] != "new":
+                plugins_list.append(
+                    {
+                        "fileareas": [
+                            {
+                                "files": [
+                                    {
+                                        "filename": fn,
+                                        "fileurl": f"https://moodle.runi.ac.il/2027/f/{fn}",
+                                        **({"filesize": sz} if sz is not None else {}),
+                                    }
+                                    for fn, sz in state["saved_files"]
+                                ]
+                            }
+                        ]
+                    }
+                )
+                if state["saved_text"]:
+                    plugins_list.append({"editorfields": [{"text": state["saved_text"]}]})
+            sub_obj = {
+                "status": state["status"],
+                "timemodified": now_ts,
+                "plugins": plugins_list,
+            }
+            sub_key = "teamsubmission" if state["teamsubmission"] else "submission"
+            return httpx.Response(
+                200,
+                json={
+                    "lastattempt": {
+                        "canedit": state["canedit"],
+                        "cansubmit": state["cansubmit"],
+                        "locked": state["locked"],
+                        "submissionsenabled": state["submissionsenabled"],
+                        sub_key: sub_obj,
+                    }
+                },
+            )
+        if "mod_assign_save_submission" in body:
+            from urllib.parse import parse_qs
+
+            state["saved_bodies"].append(body)
+            if not state["save_response"]:
+                state["status"] = "draft" if state["submissiondrafts"] else "submitted"
+                state["saved_files"] = list(state["draft_files"])
+                parsed = parse_qs(body)
+                if "plugindata[onlinetext_editor][text]" in parsed:
+                    state["saved_text"] = parsed["plugindata[onlinetext_editor][text]"][0]
+            return httpx.Response(200, json=state["save_response"])
+        if "mod_assign_submit_for_grading" in body:
+            state["submitted_for_grading"].append(body)
+            state["status"] = "submitted"
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    def upload_handler(request: httpx.Request):
+        body_bytes = request.content
+        assert b'name="itemid"\r\n\r\n' in body_bytes
+        after_id = body_bytes.split(b'name="itemid"\r\n\r\n', 1)[1].split(b"\r\n", 1)[0].decode()
+        state["upload_itemids"].append(int(after_id))
+        if b'filename="' in body_bytes:
+            fn = body_bytes.split(b'filename="', 1)[1].split(b'"', 1)[0].decode()
+            entry = (fn, None)
+            if int(after_id) == 0:
+                state["draft_files"] = [entry]
+            elif all(existing_fn != fn for existing_fn, _ in state["draft_files"]):
+                state["draft_files"].append(entry)
+            return httpx.Response(200, json=[{"filename": fn, "itemid": 777001, "filepath": "/"}])
+        return httpx.Response(200, json=[{"filename": "uploaded", "itemid": 777001, "filepath": "/"}])
+
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/rest/server.php").mock(side_effect=rest_handler)
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/upload.php").mock(side_effect=upload_handler)
+
+    # Validation: requires --accept-statement when finalizing
+    with pytest.raises(ValueError, match="--accept-statement"):
+        assignments.prepare_submission(50, files=[f1])
+
+    # Validation: duplicate filename, size limit, count limit
+    sub_dir = tmp_path / "dup"
+    sub_dir.mkdir()
+    dup_f1 = sub_dir / "report.pdf"
+    dup_f1.write_bytes(b"abc")
+    with pytest.raises(ValueError, match="Duplicate filename"):
+        assignments.prepare_submission(50, files=[f1, dup_f1], draft=True)
+
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * 101)
+    with pytest.raises(ValueError, match="exceeding"):
+        assignments.prepare_submission(50, files=[big], draft=True)
+
+    f3 = tmp_path / "extra.txt"
+    f3.write_text("x", encoding="utf-8")
+    with pytest.raises(ValueError, match="Too many files"):
+        assignments.prepare_submission(50, files=[f1, f2, f3], draft=True)
+
+    # Save as draft with 2 files + online text (reuses returned itemid 777001 on 2nd upload)
+    draft_res = assignments.submit_assignment(50, files=[f1, f2], text="Hello <world>\nLine 2", draft=True)
+    assert draft_res["status"] == "draft"
+    assert draft_res["finalized"] is False
+    assert state["upload_itemids"] == [0, 777001]
+    assert len(state["submitted_for_grading"]) == 0
+    assert "plugindata%5Bfiles_filemanager%5D=777001" in state["saved_bodies"][0]
+    assert "Hello+%26lt%3Bworld%26gt%3B%3Cbr%3ELine+2" in state["saved_bodies"][0]
+
+    # Finalize existing draft with --accept-statement
+    fin_res = assignments.submit_assignment(50, finalize_draft=True, accept_statement=True)
+    assert fin_res["status"] == "submitted"
+    assert fin_res["finalized"] is True
+    assert len(state["submitted_for_grading"]) == 1
+    assert "acceptsubmissionstatement=1" in state["submitted_for_grading"][0]
+
+    # Unlisted warning from mod_assign_save_submission fails closed and NEVER calls submit_for_grading
+    state["status"] = "draft"
+    state["submitted_for_grading"].clear()
+    state["save_response"] = [{"warningcode": "filetypenotallowed", "message": "File type not allowed"}]
+    with pytest.raises(client.MoodleError, match="filetypenotallowed"):
+        assignments.submit_assignment(50, files=[f1], accept_statement=True)
+    assert state["submitted_for_grading"] == []
+
+    # --draft rejected when assignment has submissiondrafts=0; immediate submit still enforces --accept-statement
+    state["save_response"] = []
+    state["submissiondrafts"] = 0
+    with pytest.raises(ValueError, match="does not support saving drafts"):
+        assignments.prepare_submission(50, files=[f1], draft=True)
+    with pytest.raises(ValueError, match="--accept-statement"):
+        assignments.prepare_submission(50, files=[f1], draft=False, accept_statement=False)
+    imm_res = assignments.submit_assignment(50, files=[f1], accept_statement=True)
+    assert imm_res["status"] == "submitted"
+    assert imm_res["finalized"] is True
+
+    # Concurrency guard: changed expected_state aborts before uploading
+    uploads_before = len(state["upload_itemids"])
+    with pytest.raises(ValueError, match="changed while waiting for confirmation"):
+        assignments.submit_assignment(
+            50,
+            files=[f1],
+            accept_statement=True,
+            expected_state={"status": "new", "timemodified": 0, "files": [], "text_sha256": ""},
+        )
+    assert len(state["upload_itemids"]) == uploads_before
+
+    # Post-submit status mismatch raises MoodleError
+    state["submissiondrafts"] = 1
+    state["status"] = "new"
+    orig_rest = rest_handler
+
+    def stuck_draft_rest(request: httpx.Request):
+        body = request.content.decode()
+        if "mod_assign_submit_for_grading" in body:
+            # Server returns empty warnings but leaves status in draft
+            return httpx.Response(200, json=[])
+        return orig_rest(request)
+
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/rest/server.php").mock(side_effect=stuck_draft_rest)
+    with pytest.raises(client.MoodleError, match="expected 'submitted'"):
+        assignments.submit_assignment(50, files=[f1], accept_statement=True)
+
+    # HTTP 500 on mod_assign_save_submission is NOT retried
+    save_attempts = 0
+
+    def fail_500_save(request: httpx.Request):
+        nonlocal save_attempts
+        body = request.content.decode()
+        if "mod_assign_save_submission" in body:
+            save_attempts += 1
+            return httpx.Response(500)
+        return orig_rest(request)
+
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/rest/server.php").mock(side_effect=fail_500_save)
+    with pytest.raises(httpx.HTTPStatusError):
+        assignments.submit_assignment(50, files=[f1], draft=True)
+    assert save_attempts == 1
+
+    # Missing uploaded attachment in save-and-finalize aborts BEFORE mod_assign_submit_for_grading
+    state["submitted_for_grading"].clear()
+
+    def drop_file_rest(request: httpx.Request):
+        body = request.content.decode()
+        if "mod_assign_save_submission" in body:
+            state["status"] = "draft"
+            state["saved_files"] = [("report.pdf", f1.stat().st_size)]  # intentionally omit code.py
+            return httpx.Response(200, json=[])
+        return orig_rest(request)
+
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/rest/server.php").mock(side_effect=drop_file_rest)
+    with pytest.raises(client.MoodleError, match="Skipped finalizing"):
+        assignments.submit_assignment(50, files=[f1, f2], accept_statement=True)
+    assert state["submitted_for_grading"] == []
+
+    # Stale same-name attachment with mismatched filesize aborts before finalizing
+    def wrong_size_rest(request: httpx.Request):
+        body = request.content.decode()
+        if "mod_assign_save_submission" in body:
+            state["status"] = "draft"
+            state["saved_files"] = [("report.pdf", 999)]  # wrong size
+            return httpx.Response(200, json=[])
+        return orig_rest(request)
+
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/rest/server.php").mock(side_effect=wrong_size_rest)
+    with pytest.raises(client.MoodleError, match="size 999 != expected"):
+        assignments.submit_assignment(50, files=[f1], accept_statement=True)
+    assert state["submitted_for_grading"] == []
+
+    # Missing online text in text-only submission aborts before finalizing
+    def drop_text_rest(request: httpx.Request):
+        body = request.content.decode()
+        if "mod_assign_save_submission" in body:
+            state["status"] = "draft"
+            state["saved_text"] = ""
+            return httpx.Response(200, json=[])
+        return orig_rest(request)
+
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/rest/server.php").mock(side_effect=drop_text_rest)
+    with pytest.raises(client.MoodleError, match="online text was empty"):
+        assignments.submit_assignment(50, text="My answer", accept_statement=True)
+    assert state["submitted_for_grading"] == []
+
+    # Stale non-empty online text ("Prior answer") aborts before finalizing
+    def stale_text_rest(request: httpx.Request):
+        body = request.content.decode()
+        if "mod_assign_save_submission" in body:
+            state["status"] = "draft"
+            state["saved_text"] = "<p>Prior answer</p>"
+            return httpx.Response(200, json=[])
+        return orig_rest(request)
+
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/rest/server.php").mock(side_effect=stale_text_rest)
+    with pytest.raises(client.MoodleError, match="different from the submitted text"):
+        assignments.submit_assignment(50, text="Updated answer", accept_statement=True)
+    assert state["submitted_for_grading"] == []
+
+    # Draft changing during upload is caught even when expected_state is None (--yes path)
+    state["status"] = "new"
+    state["saved_files"] = []
+    state["saved_text"] = ""
+
+    def mutate_during_upload(request: httpx.Request):
+        resp = upload_handler(request)
+        state["status"] = "draft"
+        state["saved_files"] = [("teammate.pdf", 12)]
+        return resp
+
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/rest/server.php").mock(side_effect=orig_rest)
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/upload.php").mock(side_effect=mutate_during_upload)
+    saves_before = len(state["saved_bodies"])
+    with pytest.raises(ValueError, match="changed during file upload"):
+        assignments.submit_assignment(50, files=[f1], draft=True)
+    assert len(state["saved_bodies"]) == saves_before
+
+    # Warning code echoing site token is redacted; partial save/finalize failure explains --finalize-draft
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/upload.php").mock(side_effect=upload_handler)
+    from moodle_cli.config import get_site
+
+    tok = get_site().token
+
+    def fail_finalize_rest(request: httpx.Request):
+        body = request.content.decode()
+        if "mod_assign_submit_for_grading" in body:
+            return httpx.Response(200, json=[{"warningcode": f"err_{tok}", "message": "failed"}])
+        return orig_rest(request)
+
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/rest/server.php").mock(side_effect=fail_finalize_rest)
+    with pytest.raises(client.MoodleError) as fin_exc:
+        assignments.submit_assignment(50, files=[f1], accept_statement=True)
+    assert "--finalize-draft" in str(fin_exc.value)
+    assert tok not in str(fin_exc.value)
+
+    # Team submission staying in draft returns finalized=False with warning, and image_page* files are preserved
+    img_page = tmp_path / "image_page1.png"
+    img_page.write_bytes(b"\x89PNG\r\n\x1a\n")
+    state["teamsubmission"] = 1
+    state["status"] = "new"
+    moodle_api.post("https://moodle.runi.ac.il/2027/webservice/rest/server.php").mock(side_effect=stuck_draft_rest)
+    team_res = assignments.submit_assignment(50, files=[img_page], accept_statement=True)
+    assert team_res["status"] == "draft"
+    assert team_res["finalized"] is False
+    assert any(f["filename"] == "image_page1.png" for f in team_res["files"])
+    assert any("other group members" in w for w in team_res["warnings"])

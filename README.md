@@ -108,6 +108,9 @@ mdl course 592 grades
 # Assignments & grades
 mdl assignments --status pending
 mdl assignment 12345
+mdl submit 12345 --file ./hw1.pdf --dry-run
+mdl submit 12345 --file ./hw1.pdf --draft
+mdl submit 12345 --file ./hw1.pdf --accept-statement
 mdl grades
 mdl grades "Computer Networks"
 

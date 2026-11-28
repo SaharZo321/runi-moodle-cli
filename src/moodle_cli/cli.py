@@ -670,6 +670,152 @@ def cmd_assignment(
     _run(state, lambda: assignments.get_assignment(assignment_id, state.year), render)
 
 
+def _fmt_bytes(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
+@app.command("submit")
+def cmd_submit(
+    ctx: typer.Context,
+    assignment_id: int = typer.Argument(..., help="Assignment ID from `mdl assignments`."),
+    files: Optional[list[Path]] = typer.Option(
+        None, "--file", "-f", help="File to upload (repeat -f for multiple files)."
+    ),
+    text: Optional[str] = typer.Option(None, "--text", "-t", help="Online text submission content."),
+    text_file: Optional[Path] = typer.Option(
+        None, "--text-file", help="Read online text submission content from a UTF-8 file."
+    ),
+    draft: bool = typer.Option(
+        False, "--draft", help="Save as draft only without finalizing for grading (when supported)."
+    ),
+    finalize_draft: bool = typer.Option(
+        False, "--finalize-draft", help="Submit an existing saved draft for grading."
+    ),
+    accept_statement: bool = typer.Option(
+        False, "--accept-statement", help="Accept the assignment's submission statement when finalizing."
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Skip interactive confirmation prompt (required when non-interactive)."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Validate files and preview submission without uploading or modifying Moodle."
+    ),
+    year: YearOpt = None,
+    lang: LangOpt = None,
+    as_json: JsonOpt = False,
+    pretty: PrettyOpt = False,
+) -> None:
+    """Submit files and/or online text to a Moodle assignment."""
+    state = _state(ctx, as_json=as_json, pretty=pretty, year=year, lang=lang)
+    if text is not None and text_file is not None:
+        _fail(state, "usage", "Choose either --text or --text-file, not both.", 2)
+
+    submission_text = text
+    if text_file is not None:
+        try:
+            tf = text_file.expanduser()
+            if not tf.exists():
+                _fail(state, "usage", f"Text file not found: {text_file}", 2)
+            if not tf.is_file():
+                _fail(state, "usage", f"Not a regular file: {text_file}", 2)
+            submission_text = tf.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as exc:
+            _fail(state, "error", f"Could not read text file: {exc}", 1)
+
+    def _one_line(val: object) -> str:
+        return _esc(str(val).replace("\r", " ").replace("\n", " "))
+
+    def _print_preview(preview: dict, out_console: Console) -> None:
+        out_console.print(f"[bold cyan]{_one_line(preview['name'])}[/bold cyan] ({_one_line(preview['course'])})")
+        out_console.print(
+            f"Due: {_one_line(preview['due'] or '-')}  |  Current status: [bold]{_one_line(preview['current_status'])}[/bold]"
+        )
+        action_label = {
+            "draft": "Save as draft",
+            "submit": "Submit for grading" if preview["will_finalize"] else "Save & submit",
+            "finalize": "Finalize existing draft for grading",
+        }[preview["mode"]]
+        out_console.print(f"Action: [bold]{action_label}[/bold]")
+        if preview["files"]:
+            out_console.print("Files:")
+            for f in preview["files"]:
+                out_console.print(f"  - {_one_line(f['name'])} ({_fmt_bytes(f['size'])})")
+        if preview["mode"] == "finalize":
+            if preview.get("existing_files"):
+                out_console.print("Existing draft files to finalize:")
+                for f in preview["existing_files"]:
+                    out_console.print(f"  - {_one_line(f['filename'])}")
+            if preview.get("existing_text_present"):
+                out_console.print("Existing online text draft will be finalized.")
+        elif preview["files"] and preview.get("existing_files"):
+            out_console.print("Existing files that will be replaced:")
+            for f in preview["existing_files"]:
+                out_console.print(f"  - {_one_line(f['filename'])}")
+        if preview["text_length"] is not None:
+            out_console.print(f"Online text: {preview['text_length']} chars")
+        for w in preview["warnings"]:
+            out_console.print(f"[yellow]Warning: {_one_line(w)}[/yellow]")
+
+    def execute() -> dict:
+        expected_state: dict | None = None
+        if dry_run or not yes:
+            preview = assignments.prepare_submission(
+                assignment_id,
+                files=files,
+                text=submission_text,
+                draft=draft,
+                finalize_draft=finalize_draft,
+                accept_statement=accept_statement,
+                year=state.year,
+            )
+            if dry_run:
+                return {"dry_run": True, **preview}
+
+            if not _stdin_is_tty():
+                raise ValueError("Refusing to submit non-interactively without --yes (use --dry-run to preview).")
+            _print_preview(preview, err_console)
+            err_console.print("Proceed? [y/N]: ", end="", markup=False)
+            try:
+                answer = input().strip().lower()
+            except EOFError:
+                raise typer.Abort()
+            if answer not in {"y", "yes"}:
+                raise typer.Abort()
+            expected_state = preview.get("state_snapshot")
+
+        return assignments.submit_assignment(
+            assignment_id,
+            files=files,
+            text=submission_text,
+            draft=draft,
+            finalize_draft=finalize_draft,
+            accept_statement=accept_statement,
+            year=state.year,
+            expected_state=expected_state,
+        )
+
+    def render(res: dict) -> None:
+        if res.get("dry_run"):
+            console.print("[bold yellow]Dry run (no changes sent to Moodle):[/bold yellow]")
+            _print_preview(res, console)
+            return
+        label = "Saved draft" if res.get("status") == "draft" else "Submitted"
+        console.print(
+            f"[green]{label}[/green] [bold cyan]{_one_line(res['name'])}[/bold cyan] "
+            f"(status: [bold]{_one_line(res['status'])}[/bold], modified: {_one_line(res['last_modified'] or '-')})"
+        )
+        for f in res.get("files", []):
+            console.print(f"  - {_one_line(f['filename'])}")
+        for w in res.get("warnings", []):
+            console.print(f"[yellow]Warning: {_one_line(w)}[/yellow]")
+
+    _run(state, execute, render)
+
+
 @app.command("grades")
 def cmd_grades(
     ctx: typer.Context,
