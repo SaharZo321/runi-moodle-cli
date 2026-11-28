@@ -9,15 +9,47 @@ Built on the Moodle API modules from [shanikn/Moodle_MCP](https://github.com/sha
 ## Install
 
 ### Standalone binary (no Python required)
-Download the prebuilt binary for your OS from the [latest GitHub Release](https://github.com/SaharZo321/moodle-cli/releases/latest) (`mdl-windows-x64.exe`, `mdl-macos-arm64`, or `mdl-linux-x64`) and verify against `SHA256SUMS.txt`:
+Download the binary for your OS from the [latest GitHub Release](https://github.com/SaharZo321/moodle-cli/releases/latest), plus `SHA256SUMS.txt` to verify it. Browser SSO (`--browser`) works out of the box with your installed Chrome, Brave, or Edge.
 
+| OS | File |
+| --- | --- |
+| Windows (x64) | `mdl-windows-x64.exe` |
+| macOS (Apple Silicon) | `mdl-macos-arm64` |
+| Linux (x64) | `mdl-linux-x64` |
+
+On Intel Macs, or other architectures, install with Python / `uv` below.
+
+#### Windows
+```powershell
+# Verify the checksum (compare with the line for mdl-windows-x64.exe in SHA256SUMS.txt)
+Get-FileHash .\mdl-windows-x64.exe -Algorithm SHA256
+
+# Optional: rename to mdl.exe and move it to a folder on your PATH
+Rename-Item .\mdl-windows-x64.exe mdl.exe
+.\mdl.exe --version
+```
+The binary is unsigned, so Windows SmartScreen may warn on first run: choose **More info** then **Run anyway**.
+
+#### macOS
 ```bash
-# Linux / macOS: mark executable and run (substitute mdl-macos-arm64 on macOS)
-chmod +x ./mdl-linux-x64
-./mdl-linux-x64 --version
+# Verify the checksum
+shasum -a 256 -c SHA256SUMS.txt --ignore-missing
 
-# macOS Gatekeeper (unsigned binary):
+# Mark executable and clear the Gatekeeper quarantine flag (the binary is unsigned)
+chmod +x ./mdl-macos-arm64
 xattr -d com.apple.quarantine ./mdl-macos-arm64
+
+# Optional: install on your PATH as `mdl`
+sudo mv ./mdl-macos-arm64 /usr/local/bin/mdl
+mdl --version
+```
+
+#### Linux
+```bash
+sha256sum -c SHA256SUMS.txt --ignore-missing
+chmod +x ./mdl-linux-x64
+sudo mv ./mdl-linux-x64 /usr/local/bin/mdl
+mdl --version
 ```
 
 ### With Python / `uv`
@@ -31,9 +63,14 @@ uv tool install git+https://github.com/SaharZo321/moodle-cli.git
 git clone https://github.com/SaharZo321/moodle-cli.git
 cd moodle-cli
 uv tool install .
+
+# Or run once without installing (works the same on Windows, macOS, and Linux)
+uvx --from git+https://github.com/SaharZo321/moodle-cli.git mdl --version
 ```
 
 Installs `mdl` and `moodle-cli` (with `runi` and `runi-moodle-cli` kept as backward-compatible aliases).
+
+The `[browser]` extra is no longer needed (browser SSO is built in); it is kept only so older install commands keep working.
 
 ## Sign In
 
@@ -59,7 +96,7 @@ The CLI exchanges that short-lived cookie for a **long-lived Mobile App token** 
 ```bash
 mdl auth login --year 2027 --browser
 ```
-Opens an isolated temporary window using your installed Chrome, Brave, or Edge (no extra browser download needed; override with `MOODLE_BROWSER_PATH`), supports MFA, and captures the long-lived token automatically. Works in both `uv` installs and standalone binaries.
+Opens an isolated temporary window using your installed Chrome, Brave, or Edge (no extra browser download needed; override with `MOODLE_BROWSER_PATH`, e.g. `C:\Program Files\Google\Chrome\Application\chrome.exe` on Windows or `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` on macOS), supports MFA, and captures the long-lived token automatically. Works in both `uv` installs and standalone binaries.
 
 #### Option 4: Direct mobile token
 ```bash
