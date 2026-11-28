@@ -551,6 +551,7 @@ def test_login_with_credentials_pins_runi_origin_port_and_redacts_userinfo(moodl
 
 
 def test_login_with_browser_zendriver_cdp_capture_origin_pinning_and_errors(monkeypatch):
+    import asyncio
     import base64
     from types import SimpleNamespace
 
@@ -561,6 +562,7 @@ def test_login_with_browser_zendriver_cdp_capture_origin_pinning_and_errors(monk
 
     tok_b64 = base64.b64encode(b"sig:::real_mobile_tok").decode()
     fake_tok_b64 = base64.b64encode(b"sig:::evil_tok").decode()
+    created_browsers: list[object] = []
 
     class FakeTab:
         def __init__(self, scenario):
@@ -570,6 +572,7 @@ def test_login_with_browser_zendriver_cdp_capture_origin_pinning_and_errors(monk
             self.network_enabled = False
 
         def add_handler(self, event_type, fn):
+            assert asyncio.iscoroutinefunction(fn), "CDP handlers must be async def so they run on the event loop"
             self.handlers[event_type] = fn
 
         async def send(self, cmd):
@@ -581,35 +584,77 @@ def test_login_with_browser_zendriver_cdp_capture_origin_pinning_and_errors(monk
             on_resp = self.handlers[cdp.network.ResponseReceived]
 
             if self.scenario == "extra_info":
-                # Foreign origin redirect must be ignored
-                on_resp(
+                # 1. Wrong path on same origin must be ignored
+                await on_resp(
                     SimpleNamespace(
                         response=SimpleNamespace(
-                            url="https://evil.example/admin/tool/mobile/launch.php",
+                            url="https://moodle.runi.ac.il/2026/admin/tool/mobile/launch.php",
                             headers={"Location": f"moodlemobile://token={fake_tok_b64}"},
                         )
                     )
                 )
-                # Real Moodle launch.php request + ResponseReceivedExtraInfo header
-                on_req(
+                # 2. Foreign hop reusing req-1 after initial launch.php redirect must be ignored
+                await on_req(
                     SimpleNamespace(
                         request_id="req-1",
                         request=SimpleNamespace(url="https://moodle.runi.ac.il/2027/admin/tool/mobile/launch.php?service=moodle_mobile_app"),
                         redirect_response=None,
+                        document_url="",
                     )
                 )
-                on_extra(
+                await on_req(
                     SimpleNamespace(
                         request_id="req-1",
-                        headers={"Location": f"moodlemobile://token={tok_b64}"},
+                        request=SimpleNamespace(url="https://evil.example/sso"),
+                        redirect_response=None,
+                        document_url="",
+                    )
+                )
+                await on_extra(
+                    SimpleNamespace(
+                        request_id="req-1",
+                        headers={"Location": f"moodlemobile://token={fake_tok_b64}"},
+                    )
+                )
+                # 3. Real Moodle launch.php request on req-2 + delayed ResponseReceivedExtraInfo
+                async def deliver_after_waiter():
+                    await asyncio.sleep(0.02)
+                    await on_req(
+                        SimpleNamespace(
+                            request_id="req-2",
+                            request=SimpleNamespace(url="https://moodle.runi.ac.il/2027/admin/tool/mobile/launch.php?service=moodle_mobile_app"),
+                            redirect_response=None,
+                            document_url="",
+                        )
+                    )
+                    await on_extra(
+                        SimpleNamespace(
+                            request_id="req-2",
+                            headers={"Location": f"moodlemobile://token={tok_b64}"},
+                        )
+                    )
+
+                asyncio.create_task(deliver_after_waiter())
+            elif self.scenario == "redirect_response":
+                await on_req(
+                    SimpleNamespace(
+                        request_id="req-3",
+                        request=SimpleNamespace(url=f"moodlemobile://token={tok_b64}"),
+                        redirect_response=SimpleNamespace(
+                            url="https://moodle.runi.ac.il/2027/admin/tool/mobile/launch.php",
+                            headers={"Location": f"moodlemobile://token={tok_b64}"},
+                        ),
+                        document_url="",
                     )
                 )
             elif self.scenario == "closed":
                 self.closed = True
+            elif self.scenario == "timeout":
+                await asyncio.sleep(0.01)
 
     class FakeBrowser:
         def __init__(self, scenario):
-            self.main_tab = FakeTab(scenario)
+            self.main_tab = None if scenario == "no_tab" else FakeTab(scenario)
             self.stopped = False
 
         async def stop(self):
@@ -620,33 +665,56 @@ def test_login_with_browser_zendriver_cdp_capture_origin_pinning_and_errors(monk
     async def fake_start(**kwargs):
         start_calls.append(kwargs)
         if kwargs.get("browser_executable_path") == "/bad/browser":
-            raise FileNotFoundError("could not find browser\nsecond line")
-        return FakeBrowser(scenario_holder["value"])
+            raise FileNotFoundError("---------------------\nCould not determine browser executable.\n---------------------")
+        b = FakeBrowser(scenario_holder["value"])
+        created_browsers.append(b)
+        return b
 
     scenario_holder = {"value": "extra_info"}
     monkeypatch.setattr(zd, "start", fake_start)
     monkeypatch.setattr(auth, "verify_token", lambda **kw: {"userid": 1, "fullname": "Test User", "tok": kw["token"]})
 
-    # 1. Happy path: ignores foreign origin, captures ResponseReceivedExtraInfo, stops browser
-    monkeypatch.setenv("MOODLE_BROWSER_PATH", "/usr/bin/brave")
+    # 1. Happy path: async handlers, ignores wrong path and foreign redirect-chain hop, stops browser
+    monkeypatch.setenv("MOODLE_BROWSER_PATH", " /usr/bin/brave ")
     token, info = auth.login_with_browser(2027, timeout_seconds=5)
     assert token == "real_mobile_tok"
     assert info["fullname"] == "Test User"
     assert start_calls[-1]["browser"] == "auto"
     assert start_calls[-1]["headless"] is False
     assert start_calls[-1]["browser_executable_path"] == "/usr/bin/brave"
+    assert created_browsers[-1].stopped is True
+    assert created_browsers[-1].main_tab.network_enabled is True
 
-    # 2. Browser closed before redirect raises AuthError cleanly
-    scenario_holder["value"] = "closed"
+    # 2. redirect_response path captures token and cleans up
+    scenario_holder["value"] = "redirect_response"
     monkeypatch.delenv("MOODLE_BROWSER_PATH", raising=False)
+    token2, _ = auth.login_with_browser(2027, timeout_seconds=5)
+    assert token2 == "real_mobile_tok"
+    assert created_browsers[-1].stopped is True
+
+    # 3. main_tab is None raises AuthError and stops browser
+    scenario_holder["value"] = "no_tab"
+    with pytest.raises(AuthError, match="without an active tab"):
+        auth.login_with_browser(2027, timeout_seconds=5)
+    assert created_browsers[-1].stopped is True
+
+    # 4. Browser closed before redirect raises AuthError and stops browser
+    scenario_holder["value"] = "closed"
     with pytest.raises(AuthError, match="Timed out or browser was closed"):
         auth.login_with_browser(2027, timeout_seconds=5)
+    assert created_browsers[-1].stopped is True
 
-    # 3. Missing browser raises actionable AuthError with first error line only
+    # 5. Real timeout raises AuthError and stops browser
+    scenario_holder["value"] = "timeout"
+    with pytest.raises(AuthError, match="Timed out or browser was closed"):
+        auth.login_with_browser(2027, timeout_seconds=0.08)
+    assert created_browsers[-1].stopped is True
+
+    # 6. Dashed-banner zendriver error extracts the real message line, not "-----"
     monkeypatch.setenv("MOODLE_BROWSER_PATH", "/bad/browser")
     with pytest.raises(AuthError) as exc_info:
         auth.login_with_browser(2027, timeout_seconds=5)
     msg = str(exc_info.value)
-    assert "Details: could not find browser" in msg
-    assert "second line" not in msg
+    assert "Details: Could not determine browser executable." in msg
+    assert "-----" not in msg
     assert "MOODLE_BROWSER_PATH" in msg

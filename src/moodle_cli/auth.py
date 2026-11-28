@@ -495,8 +495,8 @@ def login_with_credentials(
     )
 
 
-def _is_moodle_launch_url(url: str, moodle_origin: tuple[str, str, int]) -> bool:
-    return bool(url) and _origin(url) == moodle_origin and urlparse(url).path.endswith("/admin/tool/mobile/launch.php")
+def _is_moodle_launch_url(url: str, moodle_origin: tuple[str, str, int], launch_path: str) -> bool:
+    return bool(url) and _origin(url) == moodle_origin and urlparse(url).path == launch_path
 
 
 def _extract_mobile_location(headers: Any) -> str | None:
@@ -510,6 +510,14 @@ def _extract_mobile_location(headers: Any) -> str | None:
     return None
 
 
+def _first_meaningful_line(exc: Exception) -> str:
+    for line in str(exc).splitlines():
+        cleaned = line.strip()
+        if cleaned and any(ch not in "-_=*" for ch in cleaned):
+            return cleaned
+    return ""
+
+
 def login_with_browser(
     year: int,
     base_url: str = DEFAULT_BASE_URL,
@@ -521,22 +529,27 @@ def login_with_browser(
     so the user can complete SSO/MFA and capture the long-lived Moodle mobile wstoken automatically."""
     resolved = resolve_site_url(year, base_url=base_url, site_url=site_url)
     moodle_origin = _origin(resolved)
+    launch_path = urlparse(resolved).path.rstrip("/") + "/admin/tool/mobile/launch.php"
     try:
         import zendriver as zd
         from zendriver import cdp
     except ImportError as exc:
+        detail = _first_meaningful_line(exc)
+        detail_line = f"\nDetails: {detail}" if detail else ""
         raise AuthError(
-            "Browser login requires zendriver. Reinstall moodle-cli, or use `mdl auth login` "
-            "(interactive credentials) or `--cookie` / `--token` instead."
+            "Browser login requires zendriver."
+            f"{detail_line}\n"
+            "Reinstall moodle-cli, or use `mdl auth login` (interactive credentials) or `--cookie` / `--token` instead."
         ) from exc
 
     target_url = launch_url(year=year, base_url=base_url, site_url=site_url)
-    browser_path = os.environ.get("MOODLE_BROWSER_PATH") or None
+    browser_path = os.environ.get("MOODLE_BROWSER_PATH", "").strip() or None
 
     async def _capture_redirect() -> str | None:
         captured: dict[str, str] = {}
         captured_event = asyncio.Event()
-        launch_request_ids: set[str] = set()
+        current_hop_is_launch: dict[str, bool] = {}
+        pending_extra_locations: dict[str, str] = {}
 
         def _record(location: str | None) -> None:
             if location and "value" not in captured:
@@ -550,7 +563,7 @@ def login_with_browser(
                 browser_executable_path=browser_path,
             )
         except Exception as exc:
-            detail = str(exc).strip().splitlines()[0].strip() if str(exc).strip() else ""
+            detail = _first_meaningful_line(exc)
             detail_line = f"\nDetails: {detail}" if detail else ""
             raise AuthError(
                 "Could not launch Chrome, Brave, or Microsoft Edge for browser login."
@@ -561,29 +574,54 @@ def login_with_browser(
 
         try:
             tab = browser.main_tab
+            if tab is None:
+                raise AuthError("Browser launched without an active tab; please try `mdl auth login --browser` again.")
 
-            def on_request(event: Any) -> None:
+            async def on_request(event: Any) -> None:
                 req = getattr(event, "request", None)
                 req_url = str(getattr(req, "url", "") or "")
                 req_id = getattr(event, "request_id", None)
-                if _is_moodle_launch_url(req_url, moodle_origin) and req_id is not None:
-                    launch_request_ids.add(str(req_id))
+                doc_url = str(getattr(event, "document_url", "") or "")
+
                 redir = getattr(event, "redirect_response", None)
                 redir_url = str(getattr(redir, "url", "") or "")
-                if _is_moodle_launch_url(redir_url, moodle_origin):
+                if _is_moodle_launch_url(redir_url, moodle_origin, launch_path):
                     _record(_extract_mobile_location(getattr(redir, "headers", None)))
                     if req_url.lower().startswith("moodlemobile://"):
                         _record(req_url)
 
-            def on_response_extra(event: Any) -> None:
-                req_id = getattr(event, "request_id", None)
-                if req_id is not None and str(req_id) in launch_request_ids:
-                    _record(_extract_mobile_location(getattr(event, "headers", None)))
+                if req_url.lower().startswith("moodlemobile://") and _is_moodle_launch_url(
+                    doc_url, moodle_origin, launch_path
+                ):
+                    _record(req_url)
 
-            def on_response(event: Any) -> None:
+                if req_id is not None:
+                    rid = str(req_id)
+                    if _is_moodle_launch_url(req_url, moodle_origin, launch_path):
+                        current_hop_is_launch[rid] = True
+                        if rid in pending_extra_locations:
+                            _record(pending_extra_locations.pop(rid))
+                    elif not req_url.lower().startswith("moodlemobile://"):
+                        current_hop_is_launch[rid] = False
+                        pending_extra_locations.pop(rid, None)
+
+            async def on_response_extra(event: Any) -> None:
+                req_id = getattr(event, "request_id", None)
+                if req_id is None:
+                    return
+                rid = str(req_id)
+                loc = _extract_mobile_location(getattr(event, "headers", None))
+                if not loc:
+                    return
+                if current_hop_is_launch.get(rid) is True:
+                    _record(loc)
+                elif rid not in current_hop_is_launch:
+                    pending_extra_locations[rid] = loc
+
+            async def on_response(event: Any) -> None:
                 resp = getattr(event, "response", None)
                 resp_url = str(getattr(resp, "url", "") or "")
-                if _is_moodle_launch_url(resp_url, moodle_origin):
+                if _is_moodle_launch_url(resp_url, moodle_origin, launch_path):
                     _record(_extract_mobile_location(getattr(resp, "headers", None)))
 
             tab.add_handler(cdp.network.RequestWillBeSent, on_request)
@@ -591,13 +629,14 @@ def login_with_browser(
             tab.add_handler(cdp.network.ResponseReceived, on_response)
             await tab.send(cdp.network.enable())
 
+            deadline = time.monotonic() + timeout_seconds
+            nav_timeout = max(0.1, min(30.0, deadline - time.monotonic()))
             try:
-                await tab.get(target_url)
+                await asyncio.wait_for(tab.get(target_url), timeout=nav_timeout)
             except Exception:
-                # Some browsers abort navigation when hitting a custom moodlemobile:// scheme
+                # Some browsers abort or stall navigation when hitting a custom moodlemobile:// scheme
                 pass
 
-            deadline = time.monotonic() + timeout_seconds
             while not captured_event.is_set() and time.monotonic() < deadline:
                 if getattr(browser, "stopped", False) or getattr(tab, "closed", False):
                     break

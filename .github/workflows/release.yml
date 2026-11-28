@@ -102,6 +102,7 @@ jobs:
             --collect-data pptx \
             --collect-data certifi \
             --collect-data emoji \
+            --collect-data grapheme \
             packaging/pyinstaller_entry.py
 
       - name: Smoke test standalone binary
@@ -119,6 +120,11 @@ jobs:
             exit 1
           fi
           "./dist/${FILE_NAME}" --help > /dev/null
+          TMP_CFG=$(mktemp)
+          rm -f "$TMP_CFG"
+          BROWSER_OUT=$(MOODLE_CLI_CONFIG="$TMP_CFG" MOODLE_BROWSER_PATH="/nonexistent-browser-check" "./dist/${FILE_NAME}" auth login --year 2027 --browser --json || true)
+          echo "Browser import smoke test: $BROWSER_OUT"
+          echo "$BROWSER_OUT" | grep -q "Could not launch Chrome, Brave, or Microsoft Edge"
 
       - name: Upload standalone binary
         uses: actions/upload-artifact@v4

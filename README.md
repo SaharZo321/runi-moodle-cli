@@ -55,7 +55,7 @@ mdl auth login --year 2027 --cookie
 ```
 The CLI exchanges that short-lived cookie for a **long-lived Mobile App token** automatically and saves it.
 
-#### Option 3: Browser SSO (desktop with Playwright)
+#### Option 3: Browser SSO (Chrome, Brave, or Edge)
 ```bash
 mdl auth login --year 2027 --browser
 ```
