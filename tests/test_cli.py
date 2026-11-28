@@ -479,3 +479,109 @@ def test_pyproject_script_aliases_present():
     scripts = data["project"]["scripts"]
     for name in ("mdl", "moodle-cli", "runi", "runi-moodle-cli"):
         assert scripts[name] == "moodle_cli.cli:main"
+
+
+def test_cli_submit_dry_run_confirmation_and_yes(monkeypatch, tmp_path):
+    from moodle_cli import assignments, cli
+
+    hw = tmp_path / "hw1.pdf"
+    hw.write_bytes(b"%PDF-1.4")
+    notes = tmp_path / "notes.txt"
+    notes.write_text("My online answer", encoding="utf-8")
+
+    preview = {
+        "assignment_id": 50,
+        "name": "HW 1",
+        "course": "Algorithms",
+        "due": "2027-05-01 23:59",
+        "cutoff": None,
+        "url": "https://moodle.runi.ac.il/2027/mod/assign/view.php?id=500",
+        "current_status": "new",
+        "existing_files": [],
+        "files": [{"path": str(hw), "name": "hw1.pdf", "size": 8}],
+        "text_length": None,
+        "mode": "submit",
+        "will_finalize": False,
+        "requires_statement": False,
+        "team_submission": False,
+        "warnings": [],
+    }
+    submitted_calls: list[dict] = []
+
+    monkeypatch.setattr(assignments, "prepare_submission", lambda *a, **kw: preview)
+
+    def fake_submit(assignment_id, **kw):
+        submitted_calls.append({"assignment_id": assignment_id, **kw})
+        return {
+            "assignment_id": assignment_id,
+            "name": "HW 1",
+            "course": "Algorithms",
+            "url": preview["url"],
+            "status": "submitted",
+            "last_modified": "2027-04-20 10:00",
+            "files": [{"filename": "hw1.pdf", "url": "https://moodle.runi.ac.il/2027/f/hw1.pdf"}],
+            "finalized": False,
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(assignments, "submit_assignment", fake_submit)
+
+    # 1. --dry-run returns preview JSON without calling submit_assignment
+    res_dry = runner.invoke(app, ["submit", "50", "--file", str(hw), "--dry-run", "--json"])
+    assert res_dry.exit_code == 0, res_dry.stdout
+    assert json.loads(res_dry.stdout)["dry_run"] is True
+    assert submitted_calls == []
+
+    # 2. Non-interactive without --yes is refused (exit 2)
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
+    res_no_yes = runner.invoke(app, ["submit", "50", "--file", str(hw), "--json"])
+    assert res_no_yes.exit_code == 2
+    assert "--yes" in res_no_yes.stdout
+    assert submitted_calls == []
+
+    # 3. Interactive TTY cancel ("n") exits 130 without submitting and shows literal [y/N]
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
+    res_cancel = runner.invoke(app, ["submit", "50", "--file", str(hw)], input="n\n")
+    assert res_cancel.exit_code == 130
+    assert "[y/N]" in res_cancel.output
+    assert submitted_calls == []
+
+    # 4. Interactive TTY confirm ("y") submits
+    res_ok = runner.invoke(app, ["submit", "50", "--file", str(hw)], input="y\n")
+    assert res_ok.exit_code == 0, res_ok.stdout
+    assert len(submitted_calls) == 1
+
+    # 5. --yes with -y <year> (no short-option collision) and --text-file submits non-interactively
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
+    res_tf = runner.invoke(app, ["submit", "50", "-y", "2026", "--text-file", str(notes), "--yes", "--json"])
+    assert res_tf.exit_code == 0, res_tf.stdout
+    assert json.loads(res_tf.stdout)["status"] == "submitted"
+    assert submitted_calls[-1]["text"] == "My online answer"
+    assert submitted_calls[-1]["year"] == 2026
+
+    # 6. Human output prints "Saved draft" (not "Submitted") when status is draft
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(
+        assignments,
+        "submit_assignment",
+        lambda assignment_id, **kw: {
+            "assignment_id": assignment_id,
+            "name": "HW 1",
+            "course": "Algorithms",
+            "url": preview["url"],
+            "status": "draft",
+            "last_modified": "2027-04-20 10:00",
+            "files": [{"filename": "hw1.pdf", "url": "https://moodle.runi.ac.il/2027/f/hw1.pdf"}],
+            "finalized": False,
+            "warnings": [],
+        },
+    )
+    res_draft_human = runner.invoke(app, ["submit", "50", "--file", str(hw), "--draft", "--yes"])
+    assert res_draft_human.exit_code == 0, res_draft_human.stdout
+    assert "Saved draft" in res_draft_human.stdout
+    assert "Submitted" not in res_draft_human.stdout
+
+    # 7. Directory passed to --text-file fails with "Not a regular file"
+    res_dir = runner.invoke(app, ["submit", "50", "--text-file", str(tmp_path), "--yes", "--json"])
+    assert res_dir.exit_code == 2
+    assert "Not a regular file" in res_dir.stdout
