@@ -8,20 +8,29 @@ Built on the Moodle API modules from [shanikn/Moodle_MCP](https://github.com/sha
 
 ## Install
 
+### Standalone binary (no Python required)
+Download the prebuilt binary for your OS from the [latest GitHub Release](https://github.com/SaharZo321/moodle-cli/releases/latest) (`mdl-windows-x64.exe`, `mdl-macos-arm64`, or `mdl-linux-x64`) and verify against `SHA256SUMS.txt`:
+
+```bash
+# Linux / macOS: mark executable and run (substitute mdl-macos-arm64 on macOS)
+chmod +x ./mdl-linux-x64
+./mdl-linux-x64 --version
+
+# macOS Gatekeeper (unsigned binary):
+xattr -d com.apple.quarantine ./mdl-macos-arm64
+```
+
+### With Python / `uv`
 Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/) (or `pipx` / `pip`):
 
 ```bash
-# Clone and install globally (Windows, macOS, Linux)
+# Install directly from GitHub (includes browser SSO via your existing Chrome, Brave, or Edge)
+uv tool install git+https://github.com/SaharZo321/moodle-cli.git
+
+# Or clone and install locally
 git clone https://github.com/SaharZo321/moodle-cli.git
 cd moodle-cli
 uv tool install .
-
-# Or install directly from GitHub
-uv tool install git+https://github.com/SaharZo321/moodle-cli.git
-
-# With optional Playwright browser SSO login (--browser)
-uv tool install ".[browser]"
-uvx playwright install chromium
 ```
 
 Installs `mdl` and `moodle-cli` (with `runi` and `runi-moodle-cli` kept as backward-compatible aliases).
@@ -46,11 +55,11 @@ mdl auth login --year 2027 --cookie
 ```
 The CLI exchanges that short-lived cookie for a **long-lived Mobile App token** automatically and saves it.
 
-#### Option 3: Browser SSO (desktop with Playwright)
+#### Option 3: Browser SSO (Chrome, Brave, or Edge)
 ```bash
 mdl auth login --year 2027 --browser
 ```
-Opens a Chromium window for SSO (supports MFA) and captures the long-lived token automatically.
+Opens an isolated temporary window using your installed Chrome, Brave, or Edge (no extra browser download needed; override with `MOODLE_BROWSER_PATH`), supports MFA, and captures the long-lived token automatically. Works in both `uv` installs and standalone binaries.
 
 #### Option 4: Direct mobile token
 ```bash

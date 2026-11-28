@@ -25,12 +25,12 @@ dependencies = [
     "python-pptx>=1.0.0",
     "rich>=13.9.0",
     "typer>=0.15.0",
+    "zendriver>=0.18.0",
 ]
 
 [project.optional-dependencies]
-browser = [
-    "playwright>=1.49.0",
-]
+# Kept empty for backward compatibility; browser SSO (zendriver) is now built in.
+browser = []
 
 [project.urls]
 Homepage = "https://github.com/SaharZo321/moodle-cli"

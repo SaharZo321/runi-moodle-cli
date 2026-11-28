@@ -252,7 +252,7 @@ def auth_login(
     year: Optional[int] = typer.Option(None, "--year", "-y", help="Academic year (defaults to current academic year)."),
     credentials: bool = typer.Option(False, "--credentials", help="Sign in interactively with Moodle username and password (default)."),
     username: Optional[str] = typer.Option(None, "--username", "-u", help="Moodle username for credential login."),
-    browser: bool = typer.Option(False, "--browser", help="Open a browser window (Playwright) to complete Moodle SSO."),
+    browser: bool = typer.Option(False, "--browser", help="Open Chrome, Brave, or Edge to complete Moodle SSO."),
     cookie: bool = typer.Option(False, "--cookie", help="Exchange a pasted MoodleSession cookie for a long-lived token."),
     token: bool = typer.Option(False, "--token", help="Save a Moodle mobile wstoken (or moodlemobile://token=... URL) directly."),
     site: Optional[str] = typer.Option(None, "--site", help="Full Moodle site URL for non-RUNI universities (e.g. https://moodle.uni.edu)."),
